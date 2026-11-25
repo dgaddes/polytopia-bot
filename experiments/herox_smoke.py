@@ -58,7 +58,20 @@ def collect(args):
     plans = np.zeros((lanes, 2), np.int32)
     last = [None] * lanes                       # (turn, mover) of the lane's previous decision
     buffers = [[] for _ in range(lanes)]
-    rows, finished, ticks = [], [], 0
+    decisions = np.zeros(lanes, np.int64)            # per lane: decisions and last round of the current game
+    rounds = np.zeros(lanes, np.int64)
+    rows, finished, ticks, shards = [], [], 0, []
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    def flush():
+        # one compressed shard per --shard-games finished games, so memory stays bounded
+        if rows:
+            path = out.with_name(f'{out.stem}-{len(shards):03d}.npz')
+            np.savez_compressed(path, **{k: np.stack([r[k] for r in rows]) for k in rows[0]})
+            shards.append(dict(path=path.name, rows=len(rows)))
+            rows.clear()
+    counts = np.zeros(3, np.int64)
     started = time.time()
     while len(finished) < args.games:
         mover = np.asarray(states.current_player)          # 1 or 2
@@ -73,8 +86,13 @@ def collect(args):
         choice, path, _ = act(prepared.features, prepared.masks, jax.random.split(k_act, lanes), jnp.asarray(plan))
         choice = tuple(np.asarray(c) for c in choice)
         path = tuple(np.asarray(p) for p in path)
+        kept = rng.random(lanes) < args.keep
         for i in range(lanes):
             last[i] = (int(turn[i]), int(mover[i]))
+            decisions[i] += 1
+            rounds[i] = max(rounds[i], int(turn[i]))
+            if not kept[i]:
+                continue
             buffers[i].append(dict(view=np.asarray(prepared.view[i]), opp_view=np.asarray(prepared.opp_view[i]),
                                    family=choice[0][i], source=choice[1][i], target=choice[2][i],
                                    family_mask=path[0][i], source_mask=path[1][i], target_mask=path[2][i],
@@ -88,30 +106,42 @@ def collect(args):
         for i in np.nonzero(np.asarray(tick.done))[0]:
             rewards, capped = np.asarray(tick.rewards)[i], bool(np.asarray(tick.truncated)[i])
             game = len(finished)
-            final_turn = max(r['turn'] for r in buffers[i])
+            final_turn = int(rounds[i])
             for r in buffers[i]:
                 me, other = r['seat'], 3 - r['seat']
-                rows.append(dict(r, game=game, outcome=int(herox.outcome_class(rewards[me - 1], capped)),
+                outcome = int(herox.outcome_class(rewards[me - 1], capped))
+                counts[outcome] += 1
+                rows.append(dict(r, game=game, outcome=outcome,
                                  margin=float(scores[i, me - 1] - scores[i, other - 1]),
                                  turns_left=final_turn - r['turn'],
-                                 ownership=np.where(owners[i] == me, 1., np.where(owners[i] == other, -1., 0.)
-                                                    ).astype(np.float32)))
-            finished.append(dict(game=game, decisions=len(buffers[i]), rounds=final_turn, capped=capped,
-                                 winner=0 if capped else int(np.argmax(rewards)) + 1))
-            buffers[i], last[i] = [], None
+                                 ownership=np.where(owners[i] == me, 1, np.where(owners[i] == other, -1, 0)
+                                                    ).astype(np.int8)))
+            finished.append(dict(game=game, decisions=int(decisions[i]), kept=len(buffers[i]), rounds=final_turn,
+                                 capped=capped, winner=0 if capped else int(np.argmax(rewards)) + 1))
+            buffers[i], last[i], decisions[i], rounds[i] = [], None, 0, 0
             plans[i] = 0
             print(f'game {game + 1}/{args.games}: {finished[-1]}  '
                   f'({time.time() - started:.0f}s, {ticks} ticks)', flush=True)
+            if len(finished) % args.shard_games == 0:
+                flush()
+            if len(finished) >= args.games:
+                break
         states, prepared = tick.states, tick.prepared
-    out = Path(args.out)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    stacked = {k: np.stack([r[k] for r in rows]) for k in rows[0]}
-    np.savez_compressed(out, **stacked)
-    summary = dict(rows=len(rows), games=finished, seconds=round(time.time() - started, 1),
-                   outcomes={n: int((stacked['outcome'] == c).sum()) for n, c in
+    flush()
+    summary = dict(rows=int(counts.sum()), keep=args.keep, shards=shards, games=finished,
+                   seconds=round(time.time() - started, 1),
+                   outcomes={n: int(counts[c]) for n, c in
                              (('win', herox.WIN), ('draw', herox.DRAW), ('loss', herox.LOSS))})
     out.with_suffix('.json').write_text(json.dumps(summary, indent=1) + '\n')
     print(json.dumps({k: v for k, v in summary.items() if k != 'games'}, indent=1))
+
+
+def load_data(path):
+    """A single .npz, or every shard <stem>-NNN.npz that collect wrote for that path."""
+    path = Path(path)
+    files = sorted(path.parent.glob(f'{path.stem}-[0-9][0-9][0-9].npz')) or [path]
+    parts = [dict(np.load(f)) for f in files]
+    return {k: np.concatenate([p[k] for p in parts]) for k in parts[0]}
 
 
 def train(args):
@@ -122,7 +152,7 @@ def train(args):
     from polytopia_bot.rl.cpu_engine import view_features, view_layout
     from polytopia_bot.rl.observation import Features
     params, critic = _model(args.init)
-    data = dict(np.load(args.data))
+    data = load_data(args.data)
     layout = view_layout(SIZE, 2)
     encode = jax.vmap(lambda v: view_features(v, layout, SIZE))
 
@@ -135,7 +165,7 @@ def train(args):
                     plan=jnp.asarray(data['plan'][index]), outcome=jnp.asarray(data['outcome'][index]),
                     score=herox.score_bucket(jnp.asarray(data['margin'][index])),
                     turns=herox.turns_bucket(jnp.asarray(data['turns_left'][index])),
-                    ownership=jnp.asarray(data['ownership'][index]),
+                    ownership=jnp.asarray(data['ownership'][index], jnp.float32),
                     plan_label=jnp.full(len(index), -1, jnp.int32))   # no plan labels yet
 
     games = np.unique(data['game'])
@@ -197,7 +227,9 @@ def main():
     c.add_argument('--max-turns', type=int, default=None, help='round cap (default: the training limit, 200)')
     c.add_argument('--seed', type=int, default=0)
     c.add_argument('--seed-base', type=int, default=900_000, help='first map seed')
-    c.add_argument('--out', default='runs/herox/smoke-data.npz')
+    c.add_argument('--keep', type=float, default=1., help='fraction of decisions stored (random)')
+    c.add_argument('--shard-games', type=int, default=100, help='finished games per data shard')
+    c.add_argument('--out', default='runs/herox/smoke-data.npz', help='shards are <stem>-NNN.npz beside it')
     c.set_defaults(run=collect)
     t = sub.add_parser('train')
     t.add_argument('--init', default='')
