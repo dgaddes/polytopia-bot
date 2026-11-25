@@ -1,0 +1,218 @@
+"""heroX smoke test on CPU: self-play data collection, then frozen-trunk training of the new heads.
+
+    .venv/bin/python experiments/herox_smoke.py collect --games 16 --lanes 8 --out runs/herox/smoke-data.npz
+    .venv/bin/python experiments/herox_smoke.py train --data runs/herox/smoke-data.npz --steps 200
+
+collect: heroX plays itself on engine-rs (sampled moves; a plan chosen by the macro head at the start of each turn).
+Every decision is stored as the mover's and the opponent's packed views, the action path and the plan; when the game
+ends each row is labelled with the outcome (a capped game is a draw), the final score margin, the turns remaining and
+the final tile owners. Legal masks come from the true state, as in Plato's training (docs/plato-t3.md caveat).
+
+train: Adam on the new heads and the WDL critic only (Plato's weights stay frozen), herox.head_loss, games split
+80/20 into train and validation. Reports validation losses before and after, and the outcome-frequency baseline.
+
+This checks the pipeline end to end. It is far too small to train anything useful.
+"""
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'src'))
+
+SIZE = 14
+
+
+def _model(init):
+    from polytopia_bot.rl import herox
+    if init:
+        return herox.load(init)
+    import jax
+    from polytopia_bot.rl.distributed import _critic_template, _template_params, network_spec
+    from polytopia_bot.rl.runner import load_checkpoint
+    plato = ROOT / 'weights' / 'plato' / 'final.npz'
+    spec = network_spec(plato)
+    policy = load_checkpoint(plato, _template_params(**spec))
+    critic = load_checkpoint(plato.with_name('final-critic.npz'), _critic_template(**spec))
+    return herox.from_plato(policy, critic, jax.random.key(0))
+
+
+def collect(args):
+    import jax
+    import jax.numpy as jnp
+    from polytopia_bot.rl import herox
+    from polytopia_bot.rl.rust_engine import RustGames
+    params, _ = _model(args.init)
+    lanes = args.lanes
+    engine = RustGames(SIZE, lanes, both_views=True, max_turns=args.max_turns)
+    act = jax.jit(jax.vmap(lambda f, m, k, z: herox.act(params, f, m, k, z, size=SIZE)[:3]))
+    choose = jax.jit(jax.vmap(lambda f, z, k: herox.choose_plan(params, f, z, k)[0]))
+    rng = np.random.default_rng(args.seed)
+    next_seed = iter(range(args.seed_base, args.seed_base + 10_000_000))
+    states, prepared = engine.reset(np.array([next(next_seed) for _ in range(lanes)]))
+    key = jax.random.key(args.seed)
+    plans = np.zeros((lanes, 2), np.int32)
+    last = [None] * lanes                       # (turn, mover) of the lane's previous decision
+    buffers = [[] for _ in range(lanes)]
+    rows, finished, ticks = [], [], 0
+    started = time.time()
+    while len(finished) < args.games:
+        mover = np.asarray(states.current_player)          # 1 or 2
+        turn = np.asarray(states.turn)
+        new_turn = np.array([last[i] != (int(turn[i]), int(mover[i])) for i in range(lanes)])
+        key, k_plan, k_act = jax.random.split(key, 3)
+        if new_turn.any():
+            previous = plans[np.arange(lanes), mover - 1]
+            chosen = np.asarray(choose(prepared.features, jnp.asarray(previous), jax.random.split(k_plan, lanes)))
+            plans[np.arange(lanes), mover - 1] = np.where(new_turn, chosen, previous)
+        plan = plans[np.arange(lanes), mover - 1]
+        choice, path, _ = act(prepared.features, prepared.masks, jax.random.split(k_act, lanes), jnp.asarray(plan))
+        choice = tuple(np.asarray(c) for c in choice)
+        path = tuple(np.asarray(p) for p in path)
+        for i in range(lanes):
+            last[i] = (int(turn[i]), int(mover[i]))
+            buffers[i].append(dict(view=np.asarray(prepared.view[i]), opp_view=np.asarray(prepared.opp_view[i]),
+                                   family=choice[0][i], source=choice[1][i], target=choice[2][i],
+                                   family_mask=path[0][i], source_mask=path[1][i], target_mask=path[2][i],
+                                   plan=plan[i], seat=int(mover[i]), turn=int(turn[i])))
+        scores = np.asarray(states.players.score)          # the last pre-action state (the tick resets done lanes)
+        owners = np.asarray(states.tiles.owner)
+        tick, status = engine.tick(states, choice, np.array([next(next_seed) for _ in range(lanes)]))
+        if np.any(np.asarray(status) != 0):
+            raise RuntimeError('illegal action in self-play')
+        ticks += 1
+        for i in np.nonzero(np.asarray(tick.done))[0]:
+            rewards, capped = np.asarray(tick.rewards)[i], bool(np.asarray(tick.truncated)[i])
+            game = len(finished)
+            final_turn = max(r['turn'] for r in buffers[i])
+            for r in buffers[i]:
+                me, other = r['seat'], 3 - r['seat']
+                rows.append(dict(r, game=game, outcome=int(herox.outcome_class(rewards[me - 1], capped)),
+                                 margin=float(scores[i, me - 1] - scores[i, other - 1]),
+                                 turns_left=final_turn - r['turn'],
+                                 ownership=np.where(owners[i] == me, 1., np.where(owners[i] == other, -1., 0.)
+                                                    ).astype(np.float32)))
+            finished.append(dict(game=game, decisions=len(buffers[i]), rounds=final_turn, capped=capped,
+                                 winner=0 if capped else int(np.argmax(rewards)) + 1))
+            buffers[i], last[i] = [], None
+            plans[i] = 0
+            print(f'game {game + 1}/{args.games}: {finished[-1]}  '
+                  f'({time.time() - started:.0f}s, {ticks} ticks)', flush=True)
+        states, prepared = tick.states, tick.prepared
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    stacked = {k: np.stack([r[k] for r in rows]) for k in rows[0]}
+    np.savez_compressed(out, **stacked)
+    summary = dict(rows=len(rows), games=finished, seconds=round(time.time() - started, 1),
+                   outcomes={n: int((stacked['outcome'] == c).sum()) for n, c in
+                             (('win', herox.WIN), ('draw', herox.DRAW), ('loss', herox.LOSS))})
+    out.with_suffix('.json').write_text(json.dumps(summary, indent=1) + '\n')
+    print(json.dumps({k: v for k, v in summary.items() if k != 'games'}, indent=1))
+
+
+def train(args):
+    import jax
+    import jax.numpy as jnp
+    from polytopia_bot.rl import herox, ppo
+    from polytopia_bot.rl.actions import Choice, PathMasks
+    from polytopia_bot.rl.cpu_engine import view_features, view_layout
+    from polytopia_bot.rl.observation import Features
+    params, critic = _model(args.init)
+    data = dict(np.load(args.data))
+    layout = view_layout(SIZE, 2)
+    encode = jax.vmap(lambda v: view_features(v, layout, SIZE))
+
+    def batch_of(index):
+        own, opp = encode(jnp.asarray(data['view'][index])), encode(jnp.asarray(data['opp_view'][index]))
+        return dict(features=Features(jnp.concatenate((own.board, opp.board), -1),
+                                      jnp.concatenate((own.global_state, opp.global_state), -1)),
+                    choice=Choice(*(jnp.asarray(data[k][index]) for k in ('family', 'source', 'target'))),
+                    masks=PathMasks(*(jnp.asarray(data[k][index]) for k in ('family_mask', 'source_mask', 'target_mask'))),
+                    plan=jnp.asarray(data['plan'][index]), outcome=jnp.asarray(data['outcome'][index]),
+                    score=herox.score_bucket(jnp.asarray(data['margin'][index])),
+                    turns=herox.turns_bucket(jnp.asarray(data['turns_left'][index])),
+                    ownership=jnp.asarray(data['ownership'][index]),
+                    plan_label=jnp.full(len(index), -1, jnp.int32))   # no plan labels yet
+
+    games = np.unique(data['game'])
+    rng = np.random.default_rng(args.seed)
+    val_games = set(rng.choice(games, max(1, len(games) // 5), replace=False).tolist())
+    is_val = np.isin(data['game'], list(val_games))
+    train_rows, val_rows = np.nonzero(~is_val)[0], np.nonzero(is_val)[0]
+    val_rows = rng.choice(val_rows, min(len(val_rows), args.val_rows), replace=False)
+    print(f'{len(data["game"])} rows from {len(games)} games: {len(train_rows)} train, {len(val_rows)} validation '
+          f'(games {sorted(val_games)})')
+
+    def loss(trainable, batch):
+        heads, wdl_critic = trainable
+        return herox.head_loss(dict(params, heads=heads), wdl_critic, batch)
+
+    grad = jax.jit(jax.value_and_grad(loss, has_aux=True))
+    metrics_of = jax.jit(lambda t, b: loss(t, b)[1])
+
+    def validate(trainable):
+        parts = [metrics_of(trainable, batch_of(val_rows[i:i + args.batch])) for i in range(0, len(val_rows), args.batch)]
+        sizes = [min(args.batch, len(val_rows) - i) for i in range(0, len(val_rows), args.batch)]
+        return {k: float(sum(float(p[k]) * n for p, n in zip(parts, sizes)) / sum(sizes)) for k in parts[0]}
+
+    trainable = (params['heads'], critic)
+    opt = ppo.adam_init(trainable)
+    counts = np.bincount(data['outcome'][train_rows], minlength=3) + 1e-9
+    freq = counts / counts.sum()
+    val_freq_ce = float(-np.log(freq[data['outcome'][val_rows]]).mean())
+    before = validate(trainable)
+    print('validation before:', json.dumps({k: round(v, 4) for k, v in before.items()}))
+    started = time.time()
+    for step in range(1, args.steps + 1):
+        index = rng.choice(train_rows, args.batch, replace=False)
+        (_, metrics), grads = grad(trainable, batch_of(index))
+        trainable, opt, _ = ppo.adam_step(trainable, grads, opt, learning_rate=args.lr, max_norm=1.)
+        if step % args.log_every == 0 or step == 1:
+            print(f'step {step}: loss {float(metrics["loss"]):.4f} wdl {float(metrics["wdl"]):.4f} '
+                  f'critic {float(metrics["critic"]):.4f} distill {float(metrics["distill"]):.4f} '
+                  f'({time.time() - started:.0f}s)', flush=True)
+    after = validate(trainable)
+    print('validation after: ', json.dumps({k: round(v, 4) for k, v in after.items()}))
+    print(f'validation baseline: outcome-frequency cross-entropy {val_freq_ce:.4f} '
+          f'(train frequencies win/draw/loss {np.round(freq, 3).tolist()})')
+    if args.out:
+        herox.save(args.out, dict(params, heads=trainable[0]), trainable[1],
+                   json.loads(Path(args.init).with_suffix('.json').read_text())['base'] if args.init else
+                   dict(size=SIZE, blocks=6, width=128, architecture='transformer-v3-p2-h4', obs_version=3),
+                   smoke_data=str(args.data), steps=args.steps)
+        print('saved', args.out)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='command', required=True)
+    c = sub.add_parser('collect')
+    c.add_argument('--init', default='', help='heroX checkpoint (default: convert weights/plato)')
+    c.add_argument('--games', type=int, default=16)
+    c.add_argument('--lanes', type=int, default=8, help='games played at once')
+    c.add_argument('--max-turns', type=int, default=None, help='round cap (default: the training limit, 200)')
+    c.add_argument('--seed', type=int, default=0)
+    c.add_argument('--seed-base', type=int, default=900_000, help='first map seed')
+    c.add_argument('--out', default='runs/herox/smoke-data.npz')
+    c.set_defaults(run=collect)
+    t = sub.add_parser('train')
+    t.add_argument('--init', default='')
+    t.add_argument('--data', default='runs/herox/smoke-data.npz')
+    t.add_argument('--steps', type=int, default=200)
+    t.add_argument('--batch', type=int, default=32)
+    t.add_argument('--lr', type=float, default=3e-4)
+    t.add_argument('--val-rows', type=int, default=512)
+    t.add_argument('--log-every', type=int, default=25)
+    t.add_argument('--seed', type=int, default=0)
+    t.add_argument('--out', default='')
+    t.set_defaults(run=train)
+    args = parser.parse_args()
+    args.run(args)
+
+
+if __name__ == '__main__':
+    main()
