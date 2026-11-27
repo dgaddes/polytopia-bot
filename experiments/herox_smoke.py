@@ -96,7 +96,9 @@ def collect(args):
         choice, path, _ = act(prepared.features, prepared.masks, jax.random.split(k_act, lanes), jnp.asarray(plan))
         choice = tuple(np.asarray(c) for c in choice)
         path = tuple(np.asarray(p) for p in path)
-        kept = (rng.random(lanes) < args.keep) | new_turn       # the first decision of every turn is always kept
+        kept = rng.random(lanes) < args.keep
+        if args.first_rows:
+            kept |= new_turn                                     # the first decision of every turn (plan stage)
         owners = np.asarray(states.tiles.owner)
         # opponent-state labels from the true state (heroX belief heads), and the searcher's own for the baselines
         tech, stars = np.asarray(states.players.tech), np.asarray(states.players.stars)
@@ -217,6 +219,14 @@ def train(args):
     # --data a,b,...: datasets concatenated, game ids offset per dataset; each dataset is split into train and
     # validation games on its own (so one dataset's split is the same as when it is trained alone)
     parts = [load_data(d) for d in args.data.split(',')]
+    if args.row_fraction:
+        # --row-fraction 0.5,1,...: keep a random fraction of each dataset's rows (memory: ~36 KB per row)
+        fractions = [float(f) for f in args.row_fraction.split(',')]
+        sub = np.random.default_rng(args.seed + 1)
+        for i, f in enumerate(fractions):
+            if f < 1:
+                keep = sub.random(len(parts[i]['game'])) < f
+                parts[i] = {k: v[keep] for k, v in parts[i].items() if not k.startswith('turn_')}
     belief_keys = ('opp_tech', 'opp_stars', 'opp_income', 'opp_cities', 'opp_city_levels', 'opp_units', 'me_tech',
                    'me_stars', 'me_income')
     if any('opp_tech' in p for p in parts):
@@ -351,6 +361,8 @@ def main():
     c.add_argument('--seed', type=int, default=0)
     c.add_argument('--seed-base', type=int, default=900_000, help='first map seed')
     c.add_argument('--keep', type=float, default=1., help='fraction of decisions stored (random)')
+    c.add_argument('--no-first-rows', dest='first_rows', action='store_false',
+                   help='do not force-keep the first decision of every turn (only the plan stage needs them)')
     c.add_argument('--shard-games', type=int, default=100, help='finished games per data shard')
     c.add_argument('--out', default='runs/herox/smoke-data.npz', help='shards are <stem>-NNN.npz beside it')
     c.set_defaults(run=collect)
@@ -369,6 +381,7 @@ def main():
     t.add_argument('--unfreeze-blocks', type=int, default=0,
                    help='also train the last N transformer blocks and the final norm (a scoring copy for search)')
     t.add_argument('--val-every', type=int, default=0, help='validate every N steps and keep the best (WDL) weights')
+    t.add_argument('--row-fraction', default='', help='per dataset (comma-separated, as --data): fraction of rows kept')
     t.set_defaults(run=train)
     args = parser.parse_args()
     args.run(args)
