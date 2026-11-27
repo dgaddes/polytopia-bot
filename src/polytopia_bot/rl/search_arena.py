@@ -5,7 +5,7 @@ search.TurnSearcher (lanes = K), the opponent plays its raw greedy policy
 (a TurnSearcher with one lane, which is exactly network.sample(deterministic=True)),
 or searches too when cfg['opponent_search'] gives its settings.
 cfg['value'] names a checkpoint whose value head scores the lanes instead of the
-candidate's own (TurnSearcher(value_params=...)).
+candidate's own (TurnSearcher(value_params=...)); cfg['herox_value'] a heroX checkpoint whose value token does.
 Every replayed sub-action goes through engine-rs and must be legal.
 Per game we record outcome, search compute time, how often search overrode the
 greedy turn, and the critic's score of the greedy turn (for calibration).
@@ -47,6 +47,9 @@ def _setup(cfg, core):
     opp = load_checkpoint(cfg['opponent'], checkpoint_template(cfg['opponent']))
     # cfg['value']: a second checkpoint whose (fog-only) value head scores the candidate's lanes
     value = load_checkpoint(cfg['value'], checkpoint_template(cfg['value'])) if cfg.get('value') else None
+    if cfg.get('herox_value'):   # a heroX checkpoint: its value token scores the lanes (search._value)
+        from . import herox
+        value = herox.load(cfg['herox_value'])[0]
     if cfg.get('map_mix'):   # map variants: the board for each seed comes from maps.stream (classic = identical)
         from polytopia_bot.maps.stream import MapSource
         source = MapSource(cfg['map_mix'], SIZE)

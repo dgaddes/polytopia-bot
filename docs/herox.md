@@ -125,6 +125,28 @@ Readings:
 To make plans matter, they need a signal tied to outcomes (plan-level search with the value token, or PPO on the
 plan parameters), or more diverse behaviour to imitate (several Plato snapshots, temperatures, multi-turn labels).
 
+## Search scored by the value token (2026-11-27)
+
+Plato's policy has no value head (`network.trunk` returns 0 for transformer-v3), so `TurnSearcher` on Plato alone
+scores every lane 0 and keeps the greedy turn, except for lanes that end the game. With `value_params` = a heroX
+checkpoint, `search._value` scores lanes with the value token's p(win) − p(loss) instead.
+
+`experiments/herox_search.py`: Plato + plain d=1 search (16 lanes, temperature 1, one opponent reply at temperature 1,
+scored at the searcher's next decision by stage A's value token) against raw greedy Plato, 100 maps (seeds
+6,000,000+) × both seats, the same games for both arms. Raw Plato vs itself is exactly 0.5 on these pairs.
+
+| Arm | W–L–D | Score | Elo vs raw Plato | s per searched turn (7 games on 14 cores) |
+|---|---|---|---|---|
+| leak-free (`determinize=True`) | 120–78–2 | 0.605 [0.562, 0.650] | **+74 [+44, +108]** | 4.9 |
+| leaky (true state: perfect belief) | 117–81–2 | 0.590 [0.537, 0.640] | +63 [+26, +100] | 3.6 |
+| **leaky − leak-free (paired by map)** | | | **−11 [−56, +35]** | |
+
+- The frozen-trunk value token makes search work on Plato: +74 Elo, in the range of the older bots (+56 to +104).
+- **A perfect belief adds nothing measurable here.** The older bots lost 58–148 Elo to the crude sampler (most of it
+  with robust search, which averages 64 replies, and on classic maps); for Plato with plain d=1 the gap is −11, with
+  a CI excluding a gain above +35. A learned belief network is not worth building for this search; recheck if robust
+  search becomes the default (its gain depended most on real replies).
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored

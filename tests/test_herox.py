@@ -291,3 +291,14 @@ def test_checkpoints_without_head_side_parameters_still_load(tmp_path):
     for k in herox.LATER_HEADS:
         assert all(float(jnp.abs(x).max()) == 0. for x in jax.tree.leaves(loaded['heads'][k]))
     np.testing.assert_array_equal(loaded['heads']['plan_embedding'], params['heads']['plan_embedding'])
+
+
+def test_search_scores_lanes_with_the_value_token(shapes):
+    """search._value: a heroX checkpoint as value_params scores with p(win) - p(loss) of its value token."""
+    from polytopia_bot.rl import search
+    params, _ = herox.from_plato(*_base(_spec()))
+    rows, _ = _plan_rows(shapes)
+    features = Features(rows['board'][0], rows['global_state'][0])
+    expected = herox.wdl_value(herox.value_heads(params, herox.encode(params, features.board, features.global_state, 0))['wdl'])
+    np.testing.assert_allclose(float(search._value(params, features)), float(expected), rtol=1e-6)
+    assert -1. <= float(expected) <= 1.

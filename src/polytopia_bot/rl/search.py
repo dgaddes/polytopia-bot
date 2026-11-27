@@ -162,6 +162,17 @@ class Lanes:
         return np.asarray(self.batch.terminal_rewards())
 
 
+def _value(params, features):
+    """A lane's score from the mover's view: a heroX checkpoint (rl/herox.py, as value_params) scores with its value
+    token's p(win) - p(loss) (plan 0: its trunk does not depend on the plan unless input FiLM was trained); any other
+    network with its own value head (transformer-v3 policies have none and score 0)."""
+    if 'heads' in params:
+        from . import herox
+        encoded = herox.encode(params, features.board, features.global_state, 0)
+        return herox.wdl_value(herox.value_heads(params, encoded)['wdl'])
+    return network.trunk(params, features)[2]
+
+
 class _Nets:
     """Jitted network calls over a batch of lanes (packed views in, choices / values out)."""
 
@@ -174,7 +185,7 @@ class _Nets:
             return tempered_sample(params, features(view), masks, key, size=size, temperature=temperature,
                                    greedy=greedy, force=force, forced=(ff, fs))
         self.sample = jax.jit(jax.vmap(sample, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0)))
-        self.value = jax.jit(jax.vmap(lambda params, view: network.trunk(params, features(view))[2], in_axes=(None, 0)))
+        self.value = jax.jit(jax.vmap(lambda params, view: _value(params, features(view)), in_axes=(None, 0)))
         self.root_first = jax.jit(lambda params, view, masks, key, lanes: root_first_actions(
             params, features(view), masks, key, size=size, lanes=lanes), static_argnums=4)
         self.split = jax.jit(jax.vmap(jax.random.split))
