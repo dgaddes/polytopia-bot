@@ -183,6 +183,44 @@ Search with it, same 100 maps × both seats as above (`--herox runs/herox/scorer
 A 4% lower WDL cross-entropy is worth about +30 Elo in search: the scorer's quality is the lever, not the belief.
 Not significant at 100 maps; more data and more unfrozen blocks are the next steps.
 
+### Four blocks, 7,000 games and belief heads (2026-11-27)
+
+`belief5000`: 5,000 more Plato self-play games (seeds 4,000,000+, 1 decision in 25 kept, opponent-state labels),
+plus the earlier 2,000 games at half their rows: 574,247 positions. From the 2-block scorer, the last 4 blocks, the
+final norm, the value, belief and critic heads trained 16,000 steps × 64 (lr 1e-4), best of 8 validations kept
+(step 12,000). Validation: 4,096 positions of 1,400 held-out games.
+
+| Belief head (held-out) | heroX | belief.py rule | most common bucket |
+|---|---|---|---|
+| opponent tech (per tech) | **97.3%** | 91.9% (own tech) | 91.5% |
+| stars (5-star buckets) | **66.8%** | 57.2% (own stars − own income) | 63.3% |
+| income (2-star buckets) | **35.3%** | 13.7% (own income) | 9.5% |
+| cities | **58.2%** | — | 18.7% |
+| total city level (3-level buckets) | **56.4%** | — | 12.4% |
+| units (2-unit buckets) | **49.9%** | — | 9.4% |
+
+WDL cross-entropy on this held-out set: 0.219 at the start (the 2-block scorer), 0.210 after.
+
+Search, same 100 maps × both seats:
+
+| Scorer | W–L–D | Elo vs raw Plato |
+|---|---|---|
+| stage A | 120–78–2 | +74 [+44, +108] |
+| 2 blocks (2,000 games) | 128–69–3 | +106 [+69, +145] |
+| 4 blocks + belief (7,000 games) | 118–80–2 | +67 [+28, +106] |
+
+Paired by map: 4 blocks + belief − 2 blocks = **−39 [−79, −2]** (worse on 22 games, better on 10); − stage A =
+−7 [−51, +36].
+
+- The belief heads work as predictors: they beat every rule `belief.py` uses, by 3× fewer tech errors and 3–5× the
+  frequency baseline on the economy targets.
+- **But the scorer got worse for search, while its outcome cross-entropy got better** (0.219 → 0.210 on the same
+  held-out positions). Predicting the final result of a game from a position is not the same as ranking 16
+  candidate turns from one position: the outcome loss rewards features that say who is ahead (economy, cities),
+  which barely differ between candidate turns. The offline WDL metric does not predict search strength.
+- Two changes were made at once (4 blocks + 3.5× data, and the belief losses), so which one hurt is not known; and
+  the 2-block scorer's +106 is the best of three arms on the same maps, so part of its lead may be luck.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored
