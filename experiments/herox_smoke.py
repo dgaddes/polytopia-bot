@@ -176,7 +176,20 @@ def train(args):
     from polytopia_bot.rl.cpu_engine import view_features, view_layout
     from polytopia_bot.rl.observation import Features
     params, critic = _model(args.init)
-    data = load_data(args.data)
+    # --data a,b,...: datasets concatenated, game ids offset per dataset; each dataset is split into train and
+    # validation games on its own (so one dataset's split is the same as when it is trained alone)
+    parts = [load_data(d) for d in args.data.split(',')]
+    keys = sorted(set.intersection(*(set(p) for p in parts)) - {k for k in parts[0] if k.startswith('turn_')})
+    rng = np.random.default_rng(args.seed)
+    val_parts = []
+    for i, part in enumerate(parts):
+        games = np.unique(part['game'])
+        held = np.random.default_rng(args.seed).choice(games, max(1, len(games) // 5), replace=False)
+        val_parts.append(np.isin(part['game'], held))
+        part['game'] = part['game'] + 1_000_000 * i
+    data = {k: np.concatenate([p[k] for p in parts]) for k in keys}
+    is_val = np.concatenate(val_parts)
+    del parts
     layout = view_layout(SIZE, 2)
     encode = jax.vmap(lambda v: view_features(v, layout, SIZE))
 
@@ -193,21 +206,32 @@ def train(args):
                     plan_label=jnp.full(len(index), -1, jnp.int32))   # no plan labels yet
 
     games = np.unique(data['game'])
-    rng = np.random.default_rng(args.seed)
-    val_games = set(rng.choice(games, max(1, len(games) // 5), replace=False).tolist())
-    is_val = np.isin(data['game'], list(val_games))
     train_rows, val_rows = np.nonzero(~is_val)[0], np.nonzero(is_val)[0]
     val_rows = rng.choice(val_rows, min(len(val_rows), args.val_rows), replace=False)
     print(f'{len(data["game"])} rows from {len(games)} games: {len(train_rows)} train, {len(val_rows)} validation '
-          f'(games {sorted(val_games)})')
+          f'({len(np.unique(data["game"][is_val]))} held-out games)')
 
     names = herox.VALUE_HEADS if args.stage == 'value' else tuple(params['heads'])
     train_heads, frozen_heads = herox.head_group(params['heads'], names)
     print(f'stage {args.stage}: training heads {sorted(train_heads)} and the critic')
+    n = args.unfreeze_blocks
+    blocks = params['policy']['transformer']
+    if n:
+        # A SCORING copy: the last n transformer blocks and the final norm train with the value losses, so this
+        # checkpoint's policy is no longer Plato's. Use it as search's value_params, never to choose moves.
+        print(f'unfreezing the last {n} of {len(blocks)} transformer blocks and the final norm (scoring copy)')
+    tail = dict(blocks=tuple(blocks[len(blocks) - n:]), norm=params['policy']['v3_final_norm']) if n else {}
+
+    def merged(heads, tail):
+        policy = params['policy']
+        if tail:
+            policy = dict(policy, transformer=tuple(blocks[:len(blocks) - n]) + tuple(tail['blocks']),
+                          v3_final_norm=tail['norm'])
+        return dict(params, policy=policy, heads={**frozen_heads, **heads})
 
     def loss(trainable, batch):
-        heads, wdl_critic = trainable
-        return herox.head_loss(dict(params, heads={**frozen_heads, **heads}), wdl_critic, batch)
+        heads, wdl_critic, tail = trainable
+        return herox.head_loss(merged(heads, tail), wdl_critic, batch)
 
     grad = jax.jit(jax.value_and_grad(loss, has_aux=True))
     metrics_of = jax.jit(lambda t, b: loss(t, b)[1])
@@ -217,13 +241,14 @@ def train(args):
         sizes = [min(args.batch, len(val_rows) - i) for i in range(0, len(val_rows), args.batch)]
         return {k: float(sum(float(p[k]) * n for p, n in zip(parts, sizes)) / sum(sizes)) for k in parts[0]}
 
-    trainable = (train_heads, critic)
+    trainable = (train_heads, critic, tail)
     opt = ppo.adam_init(trainable)
     counts = np.bincount(data['outcome'][train_rows], minlength=3) + 1e-9
     freq = counts / counts.sum()
     val_freq_ce = float(-np.log(freq[data['outcome'][val_rows]]).mean())
     before = validate(trainable)
     print('validation before:', json.dumps({k: round(v, 4) for k, v in before.items()}))
+    best = (before['wdl'], 0, trainable)
     started = time.time()
     for step in range(1, args.steps + 1):
         index = rng.choice(train_rows, args.batch, replace=False)
@@ -233,15 +258,26 @@ def train(args):
             print(f'step {step}: loss {float(metrics["loss"]):.4f} wdl {float(metrics["wdl"]):.4f} '
                   f'critic {float(metrics["critic"]):.4f} distill {float(metrics["distill"]):.4f} '
                   f'({time.time() - started:.0f}s)', flush=True)
+        if args.val_every and step % args.val_every == 0 and step < args.steps:
+            mid = validate(trainable)
+            print(f'validation at step {step}:', json.dumps({k: round(v, 4) for k, v in mid.items()}), flush=True)
+            if mid['wdl'] < best[0]:
+                best = (mid['wdl'], step, trainable)
     after = validate(trainable)
+    if args.val_every:
+        if after['wdl'] < best[0]:
+            best = (after['wdl'], args.steps, trainable)
+        print(f'best validation WDL cross-entropy {best[0]:.4f} at step {best[1]} (kept)')
+        trainable = best[2]
     print('validation after: ', json.dumps({k: round(v, 4) for k, v in after.items()}))
     print(f'validation baseline: outcome-frequency cross-entropy {val_freq_ce:.4f} '
           f'(train frequencies win/draw/loss {np.round(freq, 3).tolist()})')
     if args.out:
-        herox.save(args.out, dict(params, heads={**frozen_heads, **trainable[0]}), trainable[1],
+        herox.save(args.out, merged(trainable[0], trainable[2]), trainable[1],
                    json.loads(Path(args.init).with_suffix('.json').read_text())['base'] if args.init else
                    dict(size=SIZE, blocks=6, width=128, architecture='transformer-v3-p2-h4', obs_version=3),
-                   smoke_data=str(args.data), steps=args.steps, stage=args.stage)
+                   smoke_data=str(args.data), steps=args.steps, stage=args.stage, unfreeze_blocks=n,
+                   scoring_only=bool(n), best_step=best[1] if args.val_every else args.steps)
         print('saved', args.out)
 
 
@@ -261,7 +297,7 @@ def main():
     c.set_defaults(run=collect)
     t = sub.add_parser('train')
     t.add_argument('--init', default='')
-    t.add_argument('--data', default='runs/herox/smoke-data.npz')
+    t.add_argument('--data', default='runs/herox/smoke-data.npz', help='one dataset, or several separated by commas')
     t.add_argument('--steps', type=int, default=200)
     t.add_argument('--batch', type=int, default=32)
     t.add_argument('--lr', type=float, default=3e-4)
@@ -271,6 +307,9 @@ def main():
     t.add_argument('--out', default='')
     t.add_argument('--stage', choices=('value', 'all'), default='all',
                    help='value: train only the value heads and the critic (FiLM, plan embedding, gate, macro frozen)')
+    t.add_argument('--unfreeze-blocks', type=int, default=0,
+                   help='also train the last N transformer blocks and the final norm (a scoring copy for search)')
+    t.add_argument('--val-every', type=int, default=0, help='validate every N steps and keep the best (WDL) weights')
     t.set_defaults(run=train)
     args = parser.parse_args()
     args.run(args)

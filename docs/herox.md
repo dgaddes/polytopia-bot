@@ -147,6 +147,32 @@ scored at the searcher's next decision by stage A's value token) against raw gre
   a CI excluding a gain above +35. A learned belief network is not worth building for this search; recheck if robust
   search becomes the default (its gain depended most on real replies).
 
+### A scoring copy with the last two blocks unfrozen
+
+Search uses Plato for the candidate turns and the heroX checkpoint only to score them, so the scorer's trunk can be
+fine-tuned for value without touching the policy search samples from. `herox_smoke.py train --unfreeze-blocks 2`
+trains the last 2 of 6 transformer blocks and the final norm with the value heads and critic (the saved checkpoint
+is marked `scoring_only`: its policy is no longer Plato's). From stage A, on both datasets (2,000 games, 435,214
+positions), 8,000 steps × 64, lr 1e-4, validation every 1,000 steps on 4,096 positions of 400 held-out games
+(best kept: the last), CPU ~35 min:
+
+| Validation | Stage A | Unfrozen 2 blocks |
+|---|---|---|
+| WDL cross-entropy | 0.2153 | **0.2059** |
+| WDL accuracy | 90.8% | 91.4% |
+| Ownership MSE / score CE / turns CE | 0.432 / 1.547 / 1.215 | 0.362 / 1.483 / 1.096 |
+
+Search with it, same 100 maps × both seats as above (`--herox runs/herox/scorer-u2.npz`):
+
+| Scorer | W–L–D | Elo vs raw Plato | s per searched turn |
+|---|---|---|---|
+| stage A | 120–78–2 | +74 [+44, +108] | 4.9 |
+| **unfrozen 2 blocks** | 128–69–3 | **+106 [+69, +145]** | 5.5 |
+| **difference (paired by map)** | better on 20 games, worse on 11 | **+32 [−9, +70]** (positive in 93% of resamples) | |
+
+A 4% lower WDL cross-entropy is worth about +30 Elo in search: the scorer's quality is the lever, not the belief.
+Not significant at 100 maps; more data and more unfrozen blocks are the next steps.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored
