@@ -23,6 +23,8 @@ board [14,14,151] + global [525]
   │                  (Plato's heads; family logits + family_bias[z]; target query + gate·e_z)
   ├─ PLAN  → LayerNorm → Linear 128→16               macro logits
   ├─ VALUE → WDL (LN → 128→128 → SiLU → 128→3), score margin (21 buckets), turns remaining (20 buckets)
+  ├─ VALUE → belief (LN → 128→256 → SiLU): opponent tech (128 yes/no, 41 real ids) and economy
+  │          (stars, income, cities, total city level, units: 16 buckets each)
   └─ tiles → ownership (tanh per tile)
 privileged critic: Plato's branch on the 50 public tokens + opponent view → 3 WDL logits (training only)
 ```
@@ -57,8 +59,15 @@ p(win) − p(loss) ≈ tanh(v). It needs a short warm-up against real outcomes.
 | Macro head | 2,320 |
 | WDL head | 17,155 |
 | Score-margin + turns-remaining + ownership heads | 21,930 |
-| **heroX policy** | **3,322,952** |
+| Belief heads (opponent tech + economy) | 86,736 |
+| **heroX policy** | **3,409,688** |
 | WDL critic (training only) | 401,063 |
+
+**Belief heads.** Auxiliary targets for the scoring copy: the opponent's hidden state, labelled from the true state
+during collection (`players.tech`, `players.stars`, engine income, `cities.owner/level`, `units.owner`), predicted
+from the mover's own view through the VALUE token, so they shape the representation the WDL head reads. They are
+also a learned replacement for `belief.py`'s rules (enemy tech = own tech; enemy stars = own stars − own income),
+which the collection labels as baselines. Older checkpoints load with these heads freshly initialized.
 
 ## Losses available now
 
@@ -72,6 +81,7 @@ p(win) − p(loss) ≈ tanh(v). It needs a short warm-up against real outcomes.
 | `score`, `turns` | cross-entropy to the final score-margin bucket (1,000 points each, ±10,000) and turns-remaining bucket (10 turns each) |
 | `ownership` | mean squared error to the final owner of each tile (+1 own, 0 none, −1 opponent) |
 | `macro` | cross-entropy to a plan label (e.g. clustered next-turns statistics); rows with label −1 are skipped |
+| `tech`, `economy` | opponent tech: binary cross-entropy over the real tech ids; economy: mean cross-entropy over the five bucketed targets (rows without labels are masked) |
 
 For step 1 of the plan (frozen trunk), differentiate with respect to `params['heads']` only. A test checks that
 this leaves Plato's weights bit-identical.

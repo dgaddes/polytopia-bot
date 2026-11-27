@@ -98,6 +98,11 @@ def collect(args):
         path = tuple(np.asarray(p) for p in path)
         kept = (rng.random(lanes) < args.keep) | new_turn       # the first decision of every turn is always kept
         owners = np.asarray(states.tiles.owner)
+        # opponent-state labels from the true state (heroX belief heads), and the searcher's own for the baselines
+        tech, stars = np.asarray(states.players.tech), np.asarray(states.players.stars)
+        income = np.stack([np.asarray(engine.batch.income(1)), np.asarray(engine.batch.income(2))], 1)
+        city_owner, city_level = np.asarray(states.cities.owner), np.asarray(states.cities.level)
+        unit_owner = np.asarray(states.units.owner)
         for i in range(lanes):
             stats = turn_stats[i].setdefault((int(mover[i]), int(turn[i])), np.zeros(families + 2))
             stats[choice[0][i]] += 1
@@ -117,7 +122,9 @@ def collect(args):
             buffers[i].append(dict(view=np.asarray(prepared.view[i]), opp_view=np.asarray(prepared.opp_view[i]),
                                    family=choice[0][i], source=choice[1][i], target=choice[2][i],
                                    family_mask=path[0][i], source_mask=path[1][i], target_mask=path[2][i],
-                                   plan=plan[i], seat=int(mover[i]), turn=int(turn[i]), first=bool(new_turn[i])))
+                                   plan=plan[i], seat=int(mover[i]), turn=int(turn[i]), first=bool(new_turn[i]),
+                                   **_opponent_state(i, int(mover[i]), tech, stars, income, city_owner, city_level,
+                                                     unit_owner)))
         scores = np.asarray(states.players.score)          # the last pre-action state (the tick resets done lanes)
         tick, status = engine.tick(states, choice, np.array([next(next_seed) for _ in range(lanes)]))
         if np.any(np.asarray(status) != 0):
@@ -160,6 +167,37 @@ def collect(args):
     print(json.dumps({k: v for k, v in summary.items() if k != 'games'}, indent=1))
 
 
+def _opponent_state(i, me, tech, stars, income, city_owner, city_level, unit_owner):
+    """Row labels for heroX's belief heads: the opponent's tech, stars, income, cities, total city level and units at
+    this decision (true state), and the mover's own tech, stars and income (for the rule-based baselines)."""
+    o = 3 - me
+    theirs = city_owner[i] == o
+    return dict(opp_tech=tech[i, o - 1].astype(bool), opp_stars=np.int16(stars[i, o - 1]),
+                opp_income=np.int16(income[i, o - 1]), opp_cities=np.int16(theirs.sum()),
+                opp_city_levels=np.int16(city_level[i][theirs].sum()), opp_units=np.int16((unit_owner[i] == o).sum()),
+                me_tech=tech[i, me - 1].astype(bool), me_stars=np.int16(stars[i, me - 1]),
+                me_income=np.int16(income[i, me - 1]))
+
+
+def _belief_baselines(data, rows, train_rows):
+    """Accuracy of belief.py's rules (enemy tech = own tech; enemy stars = own stars - own income) and of the most
+    frequent training bucket, on the same targets as herox.head_loss's tech_accuracy / <economy>_accuracy."""
+    from polytopia_bot.rl import herox
+    valid = herox.tech_mask()
+    out = dict(rows=int(len(rows)), tech_copy_own=float((data['me_tech'][rows] == data['opp_tech'][rows])[:, valid].mean()),
+               tech_majority=float(np.maximum(data['opp_tech'][train_rows][:, valid].mean(0),
+                                              1 - data['opp_tech'][train_rows][:, valid].mean(0)).mean()))
+    bucket = lambda k, v: np.clip(np.asarray(v) // herox.ECONOMY_SCALE[k], 0, herox.ECONOMY_BUCKETS - 1)
+    truth = {k: bucket(k, data[f'opp_{k}'][rows]) for k in herox.ECONOMY}
+    rule = bucket('stars', np.maximum(data['me_stars'][rows].astype(int) - data['me_income'][rows], 0))
+    out['stars_own_minus_income'] = float((rule == truth['stars']).mean())
+    out['income_copy_own'] = float((bucket('income', data['me_income'][rows]) == truth['income']).mean())
+    for k in herox.ECONOMY:
+        common = np.bincount(bucket(k, data[f'opp_{k}'][train_rows]), minlength=herox.ECONOMY_BUCKETS).argmax()
+        out[f'{k}_majority'] = float((truth[k] == common).mean())
+    return {k: round(v, 4) if isinstance(v, float) else v for k, v in out.items()}
+
+
 def load_data(path):
     """A single .npz, or every shard <stem>-NNN.npz that collect wrote for that path."""
     path = Path(path)
@@ -179,6 +217,16 @@ def train(args):
     # --data a,b,...: datasets concatenated, game ids offset per dataset; each dataset is split into train and
     # validation games on its own (so one dataset's split is the same as when it is trained alone)
     parts = [load_data(d) for d in args.data.split(',')]
+    belief_keys = ('opp_tech', 'opp_stars', 'opp_income', 'opp_cities', 'opp_city_levels', 'opp_units', 'me_tech',
+                   'me_stars', 'me_income')
+    if any('opp_tech' in p for p in parts):
+        # datasets collected before the belief labels: placeholders, masked out of the belief losses by has_belief
+        for p in parts:
+            rows = len(p['game'])
+            p['has_belief'] = np.full(rows, 'opp_tech' in p)
+            for k in belief_keys:
+                if k not in p:
+                    p[k] = np.zeros((rows, herox.TECH_SLOTS), bool) if k.endswith('tech') else np.zeros(rows, np.int16)
     keys = sorted(set.intersection(*(set(p) for p in parts)) - {k for k in parts[0] if k.startswith('turn_')})
     rng = np.random.default_rng(args.seed)
     val_parts = []
@@ -203,7 +251,15 @@ def train(args):
                     score=herox.score_bucket(jnp.asarray(data['margin'][index])),
                     turns=herox.turns_bucket(jnp.asarray(data['turns_left'][index])),
                     ownership=jnp.asarray(data['ownership'][index], jnp.float32),
-                    plan_label=jnp.full(len(index), -1, jnp.int32))   # no plan labels yet
+                    plan_label=jnp.full(len(index), -1, jnp.int32),   # no plan labels yet
+                    **belief_of(index))
+
+    def belief_of(index):
+        if 'opp_tech' not in data:
+            return {}
+        return dict(opp_tech=jnp.asarray(data['opp_tech'][index]), has_belief=jnp.asarray(data['has_belief'][index]),
+                    economy=herox.economy_buckets(*(jnp.asarray(data[f'opp_{k}'][index], jnp.int32)
+                                                    for k in herox.ECONOMY)))
 
     games = np.unique(data['game'])
     train_rows, val_rows = np.nonzero(~is_val)[0], np.nonzero(is_val)[0]
@@ -272,6 +328,9 @@ def train(args):
     print('validation after: ', json.dumps({k: round(v, 4) for k, v in after.items()}))
     print(f'validation baseline: outcome-frequency cross-entropy {val_freq_ce:.4f} '
           f'(train frequencies win/draw/loss {np.round(freq, 3).tolist()})')
+    if 'opp_tech' in data:
+        print('belief baselines on the validation rows with labels:', json.dumps(_belief_baselines(
+            data, val_rows[data['has_belief'][val_rows]], train_rows[data['has_belief'][train_rows]])))
     if args.out:
         herox.save(args.out, merged(trainable[0], trainable[2]), trainable[1],
                    json.loads(Path(args.init).with_suffix('.json').read_text())['base'] if args.init else

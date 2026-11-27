@@ -44,15 +44,20 @@ TURN_BUCKETS, TURN_SCALE = 20, 10        # turns remaining in buckets of 10, the
 READOUT_TOKENS = 2                       # PLAN, VALUE, after GLOBAL
 MASKED = -1e9
 DRAW_BIAS = -4.                          # from_plato's critic: p(draw) starts small, p(win) - p(loss) ~ tanh(value)
+# Opponent-state (belief) heads on the VALUE token: auxiliary targets from the true state, inputs stay the own view.
+TECH_SLOTS = 128                         # players.tech width; the loss counts only the real tech ids (tech_mask)
+ECONOMY = ('stars', 'income', 'cities', 'city_levels', 'units')
+ECONOMY_BUCKETS = 16
+ECONOMY_SCALE = dict(stars=5, income=2, cities=1, city_levels=3, units=2)   # bucket width; the last bucket is open
 
 
 # ---------------------------------------------------------------- parameters
 
 def init_heads(key, width: int, families: int = 17) -> dict:
-    """The new parameters (110,030 at width 128). FiLM, head FiLM, the family bias and plan_query_gate start at zero,
+    """The new parameters (196,766 at width 128). FiLM, head FiLM, the family bias and plan_query_gate start at zero,
     so the policy is unchanged; plan_embedding is small and random (both zero would leave each other without a
     gradient)."""
-    keys = iter(jax.random.split(key, 10))
+    keys = iter(jax.random.split(key, 14))
 
     def dense(a, b, scale=1.):
         return dict(w=jax.random.normal(next(keys), (a, b)) * (scale / a ** .5), b=jnp.zeros(b))
@@ -73,6 +78,8 @@ def init_heads(key, width: int, families: int = 17) -> dict:
         score_hidden=dense(width, width), score=dense(width, SCORE_BUCKETS, .01),
         turns=dense(width, TURN_BUCKETS, .01),
         ownership=dense(width, 1, .01),
+        belief_norm=norm(), belief_hidden=dense(width, 2 * width),
+        belief_tech=dense(2 * width, TECH_SLOTS, .01), belief_economy=dense(2 * width, len(ECONOMY) * ECONOMY_BUCKETS, .01),
     )
 
 
@@ -106,7 +113,8 @@ def init(key, board_channels: int, global_channels: int, *, size: int, width: in
     return from_plato(policy, critic, c)
 
 
-VALUE_HEADS = ('value_token', 'wdl_norm', 'wdl_hidden', 'wdl', 'score_hidden', 'score', 'turns', 'ownership')
+BELIEF_HEADS = ('belief_norm', 'belief_hidden', 'belief_tech', 'belief_economy')
+VALUE_HEADS = ('value_token', 'wdl_norm', 'wdl_hidden', 'wdl', 'score_hidden', 'score', 'turns', 'ownership') + BELIEF_HEADS
 PLAN_HEADS = ('plan_token', 'plan_embedding', 'plan_query_gate', 'film', 'head_film', 'family_bias', 'macro_norm', 'macro')
 # Stage B (frozen trunk): the plan acts on the policy heads only. Input FiLM and plan_token stay as they are, so every
 # token, and so the value heads, compute exactly what they did after stage A. (Input FiLM through six frozen pre-norm
@@ -205,7 +213,34 @@ def value_heads(params: dict, encoded: dict) -> dict:
     return dict(wdl=network.dense(hidden, heads['wdl']),
                 score=network.dense(score_hidden, heads['score']),
                 turns=network.dense(v, heads['turns']),
-                ownership=jnp.tanh(network.dense(encoded['tiles'], heads['ownership'])[:, 0]))
+                ownership=jnp.tanh(network.dense(encoded['tiles'], heads['ownership'])[:, 0]),
+                **belief_heads(params, encoded))
+
+
+def belief_heads(params: dict, encoded: dict) -> dict:
+    """The opponent's hidden state from the VALUE token (own view only): tech logits [TECH_SLOTS] (one yes/no per tech)
+    and economy logits [len(ECONOMY), ECONOMY_BUCKETS] (stars, income, cities, total city level, units)."""
+    heads = params['heads']
+    hidden = jax.nn.silu(network.dense(_norm(encoded['value'], heads['belief_norm']), heads['belief_hidden']))
+    return dict(belief_tech=network.dense(hidden, heads['belief_tech']),
+                belief_economy=network.dense(hidden, heads['belief_economy']).reshape(len(ECONOMY), ECONOMY_BUCKETS))
+
+
+def economy_buckets(stars, income, cities, city_levels, units):
+    """[..., len(ECONOMY)] bucket labels of the opponent's economy (ECONOMY order)."""
+    values = dict(stars=stars, income=income, cities=cities, city_levels=city_levels, units=units)
+    return jnp.stack([jnp.clip(jnp.asarray(values[k]) // ECONOMY_SCALE[k], 0, ECONOMY_BUCKETS - 1) for k in ECONOMY],
+                     -1).astype(jnp.int32)
+
+
+def tech_mask() -> np.ndarray:
+    """[TECH_SLOTS] True for the real technology ids of the rules (gpu/rules.json)."""
+    rules = json.loads((Path(__file__).parents[1] / 'gpu' / 'rules.json').read_text())
+    mask = np.zeros(TECH_SLOTS, bool)
+    for t in rules['technologies']:
+        if 0 <= t['id'] < TECH_SLOTS:
+            mask[t['id']] = True
+    return mask
 
 
 def wdl_value(logits: jax.Array) -> jax.Array:
@@ -327,13 +362,16 @@ def _cross_entropy(logits, label):
 
 
 def head_loss(params: dict, critic: dict, batch: dict, *, wdl_coef=1., distill_coef=1., critic_coef=1., score_coef=.1,
-              turns_coef=.1, ownership_coef=.1, macro_coef=1.) -> tuple:
+              turns_coef=.1, ownership_coef=.1, macro_coef=1., tech_coef=.1, economy_coef=.1) -> tuple:
     """Supervised losses for the new heads, over a batch of rows:
 
       features, choice, masks (as ppo), plan [rows]: the plan in force
       outcome [rows] (outcome_class), score [rows] (score_bucket), turns [rows] (turns_bucket),
       ownership [rows, tiles] in {-1, 0, 1} (final owner: own, nobody, opponent),
       plan_label [rows]: a plan to imitate (e.g. a clustered next-turns statistic), or -1 for none.
+      optional opponent state: opp_tech [rows, TECH_SLOTS] bool, economy [rows, len(ECONOMY)] (economy_buckets),
+        has_belief [rows] (False for rows without these labels). Tech: binary cross-entropy over the real tech ids;
+        economy: mean cross-entropy over the five targets.
 
     WDL head: cross-entropy to the outcome plus KL from the critic's (stop-gradient) WDL. The critic: cross-entropy to
     the outcome. To train only the new heads (frozen trunk), differentiate with respect to params['heads'] only."""
@@ -352,9 +390,26 @@ def head_loss(params: dict, critic: dict, batch: dict, *, wdl_coef=1., distill_c
                  ownership=jnp.mean((out['ownership'] - batch['ownership']) ** 2), macro=macro)
     coefs = dict(wdl=wdl_coef, distill=distill_coef, critic=critic_coef, score=score_coef, turns=turns_coef,
                  ownership=ownership_coef, macro=macro_coef)
+    extra = {}
+    if 'opp_tech' in batch:
+        has = batch['has_belief'].astype(jnp.float32)
+        rows = jnp.maximum(has.sum(), 1.)
+        valid = jnp.asarray(tech_mask())
+        target = batch['opp_tech'].astype(jnp.float32)
+        logits = out['belief_tech']
+        bce = jnp.maximum(logits, 0) - logits * target + jnp.log1p(jnp.exp(-jnp.abs(logits)))
+        per_row = (bce * valid).sum(-1) / valid.sum()
+        terms['tech'] = (per_row * has).sum() / rows
+        right = ((logits > 0) == (target > .5)) & valid
+        extra['tech_accuracy'] = ((right.sum(-1) / valid.sum()) * has).sum() / rows
+        economy_ce = _cross_entropy(out['belief_economy'], batch['economy'])          # [rows, len(ECONOMY)]
+        terms['economy'] = (economy_ce.mean(-1) * has).sum() / rows
+        hit = (jnp.argmax(out['belief_economy'], -1) == batch['economy']) * has[:, None]
+        extra.update({f'{k}_accuracy': hit[:, i].sum() / rows for i, k in enumerate(ECONOMY)})
+        coefs.update(tech=tech_coef, economy=economy_coef)
     total = sum(coefs[k] * v for k, v in terms.items())
     accuracy = jnp.mean(jnp.argmax(out['wdl'], -1) == batch['outcome'])
-    return total, dict(loss=total, wdl_accuracy=accuracy, **terms)
+    return total, dict(loss=total, wdl_accuracy=accuracy, **terms, **extra)
 
 
 # ---------------------------------------------------------------- checkpoints
@@ -379,7 +434,9 @@ def template(spec: dict) -> tuple:
                                        blocks=spec['blocks'], architecture=spec['architecture']))
 
 
-LATER_HEADS = ('head_film', 'family_bias')     # added after the first heroX checkpoints; zero when absent
+# Heads added after the first heroX checkpoints, newest last. An older checkpoint loads without them; they then take
+# init_heads' values (head FiLM and the family bias zero, the belief heads random as in a fresh conversion, seed 0).
+LATER_HEADS = (('head_film', 'family_bias'), BELIEF_HEADS)
 
 
 def load(path) -> tuple:
@@ -392,17 +449,22 @@ def load(path) -> tuple:
     for tree, source in zip(trees, (path, path.with_name(path.stem + '-critic.npz'))):
         with np.load(source, allow_pickle=False) as archive:
             stored = len(archive.files)
-            added = {}
+            missing = ()
             if 'heads' in tree and stored != len(jax.tree.leaves(tree)):
-                # a checkpoint from before the head-side plan parameters: load without them, then add them at zero
-                added = {k: tree['heads'][k] for k in LATER_HEADS}
-                tree = dict(tree, heads={k: v for k, v in tree['heads'].items() if k not in LATER_HEADS})
+                for newest in range(1, len(LATER_HEADS) + 1):
+                    missing = sum(LATER_HEADS[-newest:], ())
+                    if stored == len(jax.tree.leaves({k: v for k, v in tree['heads'].items() if k not in missing})) + \
+                            len(jax.tree.leaves({k: v for k, v in tree.items() if k != 'heads'})):
+                        break
+                tree = dict(tree, heads={k: v for k, v in tree['heads'].items() if k not in missing})
             leaves, structure = jax.tree.flatten(tree)
             values = [archive[f'p{i}'] for i in range(len(leaves))]
         if any(v.shape != l.shape for v, l in zip(values, leaves, strict=True)):
             raise ValueError(f'{source}: tensor shapes do not match the heroX template')
         loaded = structure.unflatten([jnp.asarray(v) for v in values])
-        if added:
-            loaded = dict(loaded, heads={**loaded['heads'], **jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), added)})
+        if missing:
+            policy = loaded['policy']
+            fresh = init_heads(jax.random.key(0), policy['global_token']['w'].shape[1], policy['family']['w'].shape[1])
+            loaded = dict(loaded, heads={**loaded['heads'], **{k: fresh[k] for k in missing}})
         out.append(loaded)
     return tuple(out)

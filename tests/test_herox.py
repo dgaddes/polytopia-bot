@@ -42,10 +42,10 @@ def _trained(params, key=jax.random.key(42)):
 
 
 def test_parameter_counts_match_the_design():
-    """Width 128, 6 blocks, -p2-h4 at 14x14 (Plato's shape): 110,030 new parameters on Plato's 3,212,922."""
+    """Width 128, 6 blocks, -p2-h4 at 14x14 (Plato's shape): 196,766 new parameters on Plato's 3,212,922."""
     params, critic = herox.template(_spec(width=128, blocks=6))
     counts = herox.parameter_counts(params, critic)
-    assert counts == dict(base_policy=3_212_922, new_heads=110_030, policy=3_322_952, critic=401_063)
+    assert counts == dict(base_policy=3_212_922, new_heads=196_766, policy=3_409_688, critic=401_063)
 
 
 def test_conversion_plays_exactly_as_the_base_network(shapes):
@@ -215,7 +215,7 @@ def test_real_plato_converts_exactly(shapes):
     policy = load_checkpoint(PLATO, _template_params(**spec))
     critic = load_checkpoint(PLATO.with_name('final-critic.npz'), _critic_template(**spec))
     params, wdl_critic = herox.from_plato(policy, critic)
-    assert herox.parameter_counts(params, wdl_critic)['policy'] == 3_322_952
+    assert herox.parameter_counts(params, wdl_critic)['policy'] == 3_409_688
     for i in range(3):
         own = _features(jax.random.key(100 + i), *shapes)
         masks, key = _engine_masks(jax.random.key(200 + i)), jax.random.key(300 + i)
@@ -284,13 +284,17 @@ def test_head_side_plan_moves_the_policy_but_not_the_value(shapes):
 
 def test_checkpoints_without_head_side_parameters_still_load(tmp_path):
     params, critic = herox.from_plato(*_base(_spec()))
-    old = dict(params, heads={k: v for k, v in params['heads'].items() if k not in herox.LATER_HEADS})
-    herox.save(tmp_path / 'old.npz', old, critic, _spec())
-    loaded, _ = herox.load(tmp_path / 'old.npz')
-    assert set(loaded['heads']) == set(params['heads'])
-    for k in herox.LATER_HEADS:
-        assert all(float(jnp.abs(x).max()) == 0. for x in jax.tree.leaves(loaded['heads'][k]))
-    np.testing.assert_array_equal(loaded['heads']['plan_embedding'], params['heads']['plan_embedding'])
+    head_side, belief = herox.LATER_HEADS
+    for missing in (belief, head_side + belief):
+        old = dict(params, heads={k: v for k, v in params['heads'].items() if k not in missing})
+        herox.save(tmp_path / 'old.npz', old, critic, _spec())
+        loaded, _ = herox.load(tmp_path / 'old.npz')
+        assert set(loaded['heads']) == set(params['heads'])
+        for k in set(missing) & set(head_side):     # zero: the policy stays Plato's
+            assert all(float(jnp.abs(x).max()) == 0. for x in jax.tree.leaves(loaded['heads'][k]))
+        # the belief heads are initialized as in a fresh conversion (random, so they can train)
+        assert float(jnp.abs(loaded['heads']['belief_hidden']['w']).max()) > 0.
+        np.testing.assert_array_equal(loaded['heads']['plan_embedding'], params['heads']['plan_embedding'])
 
 
 def test_search_scores_lanes_with_the_value_token(shapes):
@@ -302,3 +306,45 @@ def test_search_scores_lanes_with_the_value_token(shapes):
     expected = herox.wdl_value(herox.value_heads(params, herox.encode(params, features.board, features.global_state, 0))['wdl'])
     np.testing.assert_allclose(float(search._value(params, features)), float(expected), rtol=1e-6)
     assert -1. <= float(expected) <= 1.
+
+
+def _belief_batch(shapes):
+    batch = _batch(shapes)
+    rows = len(batch['plan'])
+    tech = jax.random.bernoulli(jax.random.key(21), .4, (rows, herox.TECH_SLOTS))
+    economy = herox.economy_buckets(jnp.array([3, 40, 0, 200]), jnp.array([2, 9, 0, 50]), jnp.array([1, 4, 0, 30]),
+                                    jnp.array([1, 9, 0, 99]), jnp.array([2, 11, 0, 90]))
+    return dict(batch, opp_tech=tech, economy=economy, has_belief=jnp.array([True, True, False, True]))
+
+
+def test_economy_buckets_and_tech_mask():
+    b = herox.economy_buckets(jnp.array([0, 4, 5, 999]), jnp.array([0, 1, 2, 999]), jnp.array([0, 1, 2, 999]),
+                              jnp.array([0, 2, 3, 999]), jnp.array([0, 1, 2, 999]))
+    np.testing.assert_array_equal(b[:, 0], [0, 0, 1, herox.ECONOMY_BUCKETS - 1])          # stars, width 5
+    np.testing.assert_array_equal(b[:, 2], [0, 1, 2, herox.ECONOMY_BUCKETS - 1])          # cities, width 1
+    assert b.shape == (4, len(herox.ECONOMY))
+    mask = herox.tech_mask()
+    assert mask.shape == (herox.TECH_SLOTS,) and 30 <= mask.sum() < herox.TECH_SLOTS
+
+
+def test_belief_heads_train_from_the_own_view_only(shapes):
+    """The belief losses reach the belief heads and the value token, never Plato's weights through a heads-only
+    gradient; rows without labels (has_belief False) contribute nothing; the heads never read the opponent's view."""
+    params, critic = herox.from_plato(*_base(_spec()))
+    batch = _belief_batch(shapes)
+    (total, metrics), grads = jax.value_and_grad(lambda h: herox.head_loss(dict(params, heads=h), critic, batch),
+                                                 has_aux=True)(params['heads'])
+    for k in ('tech', 'economy', 'tech_accuracy', 'stars_accuracy', 'units_accuracy'):
+        assert np.isfinite(float(metrics[k])), k
+    for name in herox.BELIEF_HEADS:
+        assert float(max(jnp.abs(x).max() for x in jax.tree.leaves(grads[name]))) > 0., name
+    # unlabelled rows: changing their targets changes nothing
+    other = dict(batch, opp_tech=batch['opp_tech'].at[2].set(~batch['opp_tech'][2]), economy=batch['economy'].at[2].set(7))
+    _, m2 = herox.head_loss(params, critic, other)
+    np.testing.assert_allclose(float(metrics['tech']), float(m2['tech']), rtol=1e-6)
+    np.testing.assert_allclose(float(metrics['economy']), float(m2['economy']), rtol=1e-6)
+    # the heads read the own view only: the opponent's half of the features does not move them
+    own_board, own_glob, opp_board, opp_glob = transformer_v3._split_views(jax.tree.map(lambda a: a[0], batch['features']))
+    a = herox.belief_heads(params, herox.encode(params, own_board, own_glob, 0))
+    assert a['belief_tech'].shape == (herox.TECH_SLOTS,) and a['belief_economy'].shape == (len(herox.ECONOMY),
+                                                                                           herox.ECONOMY_BUCKETS)
