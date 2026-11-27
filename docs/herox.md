@@ -19,12 +19,17 @@ board [14,14,151] + global [525]
   + PLAN, VALUE tokens                               → 52 tokens
   FiLM(e_z): x ← x·(1+γ) + β on every token          (zero-initialized)
   6 transformer blocks                               (Plato's weights; readout mask, below)
-  ├─ GLOBAL, tiles → family / source / target heads  (Plato's; target query + gate·e_z)
+  ├─ GLOBAL, tiles → head FiLM(e_z) → family / source / target heads
+  │                  (Plato's heads; family logits + family_bias[z]; target query + gate·e_z)
   ├─ PLAN  → LayerNorm → Linear 128→16               macro logits
   ├─ VALUE → WDL (LN → 128→128 → SiLU → 128→3), score margin (21 buckets), turns remaining (20 buckets)
   └─ tiles → ownership (tanh per tile)
 privileged critic: Plato's branch on the 50 public tokens + opponent view → 3 WDL logits (training only)
 ```
+
+**Head-side plan conditioning.** `head_film` (128→256, zero-initialized) scales and shifts `g` and `tiles` before
+the action heads only, and `family_bias` (16×17, zero) shifts the family logits per plan. The value and ownership heads
+read the unmodulated outputs. Stage B trains these instead of input FiLM (below).
 
 **Readout mask.** PLAN and VALUE attend to all 52 tokens, but Plato's 50 tokens cannot attend to them: those
 keys get a −1e9 attention bias. This is a deliberate change from full attention, so the new tokens can never alter
@@ -48,10 +53,11 @@ p(win) − p(loss) ≈ tanh(v). It needs a short warm-up against real outcomes.
 | Plato policy (unchanged) | 3,212,922 |
 | PLAN + VALUE tokens | 256 |
 | Plan embedding (16×128) + FiLM (128→256) + query gate | 37,121 |
+| Head FiLM (128→256) + family bias (16×17) | 33,296 |
 | Macro head | 2,320 |
 | WDL head | 17,155 |
 | Score-margin + turns-remaining + ownership heads | 21,930 |
-| **heroX policy** | **3,289,656** |
+| **heroX policy** | **3,322,952** |
 | WDL critic (training only) | 401,063 |
 
 ## Losses available now
@@ -70,13 +76,60 @@ p(win) − p(loss) ≈ tanh(v). It needs a short warm-up against real outcomes.
 For step 1 of the plan (frozen trunk), differentiate with respect to `params['heads']` only. A test checks that
 this leaves Plato's weights bit-identical.
 
+## Frozen-trunk training (stages A and B, 2026-11-26)
+
+Data: Plato self-play through heroX on CPU (`experiments/herox_smoke.py collect`): positions sampled per decision,
+the first decision of every turn always kept, and a summary of every turn (action count per family, move advance
+toward the opponent's territory). Validation is always on held-out games.
+
+**Stage A: value heads only** (`herox_smoke.py train --stage value`; FiLM, plan embedding, gate, macro and Plato
+bit-identical afterwards, so the policy is still exactly Plato's). 1,000 games (228,794 positions), 3,000 steps × 64,
+CPU 8 min:
+
+| Validation (200 games) | Before | After |
+|---|---|---|
+| WDL cross-entropy (outcome-frequency baseline 0.962) | 1.102 | **0.200** |
+| WDL accuracy | 6% | **91.7%** |
+| Critic WDL cross-entropy | 0.766 | 0.218 |
+| Score / turns cross-entropy | 3.04 / 3.00 | 1.49 / 1.17 |
+| Ownership MSE | 0.625 | 0.426 |
+
+**Stage B: hindsight plans** (`experiments/herox_plans.py`). New 1,000 games (75,042 turns); k-means on the turn
+summaries gives 16 recognizable modes: openings (plans 1, 12), economy (2, 8, 13: forest, harvest, research), large
+offensives (3, 5, 9), holding/passive turns (4, 6, 7, 14), and the stalemate shuffle of capped games (15, round 94).
+Then `herox.plan_loss` (-log π(a | s, label) plus macro cross-entropy), 3,000 steps × (64 rows + 64 turn starts),
+lr 1e-3, CPU 7 min.
+
+| Validation (200 games) | Before | After |
+|---|---|---|
+| NLL per action under the turn's label (Plato: 2.373) | 2.373 | 2.375 |
+| NLL under a wrong label | 2.373 | **2.409** |
+| NLL of the macro-weighted mixture over plans (same rows: label 2.378) | 2.377 | 2.379 |
+| Macro cross-entropy (label-frequency baseline 2.532) | 2.773 | **1.013** |
+| Macro accuracy | 4% | **65%** |
+| Value WDL cross-entropy | 0.259 | **0.259** (unchanged, by construction) |
+
+Readings:
+
+- **Faithful.** Sampling the plan from the macro head reproduces Plato (+0.003 nats per action).
+- **The macro head works**: it predicts the mode of the coming turn from its first position, 65% of the time.
+- **Plans steer behaviour only weakly.** A wrong plan costs 0.034 nats per action. Forcing a plan moves the family
+  distribution by 1–13% (total variation) on the same positions: the holding plan 4 halves attacks (0.134 → 0.067)
+  and adds moves, plans 1, 6 and 7 move it 9–10%, while the offensive and economy plans stay within 2–4% of Plato.
+  The labels are mostly predictable from the position, which Plato already sees, so imitating Plato's own play can
+  only teach the plans the little that the position does not decide.
+- **Input FiLM was the wrong lever.** The first stage-B run trained input FiLM (before the six frozen pre-norm
+  blocks): γ reached 0.5 but the family distribution moved 0.6% (TV), and value cross-entropy rose 0.259 → 0.304
+  because FiLM changes every token. That run is why stage B trains the head-side parameters (`HEAD_SIDE_PLAN_HEADS`).
+
+To make plans matter, they need a signal tied to outcomes (plan-level search with the value token, or PPO on the
+plan parameters), or more diverse behaviour to imitate (several Plato snapshots, temperatures, multi-turn labels).
+
 ## Not built yet
 
-- **Data collection** for `head_loss`: outcomes, score margins, turns remaining and final ownership per position,
-  from Plato self-play.
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored
   with each row, and the WDL critic's scalar value for GAE.
-- **Plan pseudo-rewards** and plan clustering.
+- **Plan pseudo-rewards**; multi-turn plan labels.
 - **Test-time search** over plans and sampled worlds using `act`'s `value` output.
 - Studio and arena support for heroX checkpoints.
 
@@ -86,4 +139,15 @@ this leaves Plato's weights bit-identical.
 .venv/bin/python scripts/herox.py convert --out runs/herox/init.npz   # from weights/plato/final*.npz
 .venv/bin/python scripts/herox.py info runs/herox/init.npz
 .venv/bin/python -m pytest tests/test_herox.py
+
+# stage A, then stage B
+.venv/bin/python experiments/herox_smoke.py collect --init runs/herox/init.npz --games 1000 --lanes 32 --keep 0.125 \
+    --out runs/herox/k1000.npz
+.venv/bin/python experiments/herox_smoke.py train --stage value --init runs/herox/init.npz --data runs/herox/k1000.npz \
+    --steps 3000 --batch 64 --val-rows 4096 --out runs/herox/stageA.npz
+.venv/bin/python experiments/herox_smoke.py collect --init runs/herox/init.npz --games 1000 --lanes 32 --keep 0.08 \
+    --seed-base 2000000 --out runs/herox/plans1000.npz
+.venv/bin/python experiments/herox_plans.py label --data runs/herox/plans1000.npz
+.venv/bin/python experiments/herox_plans.py train --init runs/herox/stageA.npz --data runs/herox/plans1000.npz \
+    --steps 3000 --lr 1e-3 --out runs/herox/stageB.npz
 ```

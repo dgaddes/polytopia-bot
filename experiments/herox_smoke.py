@@ -45,8 +45,10 @@ def collect(args):
     import jax
     import jax.numpy as jnp
     from polytopia_bot.rl import herox
+    from polytopia_bot.rl.actions import FAMILIES
     from polytopia_bot.rl.rust_engine import RustGames
     params, _ = _model(args.init)
+    MOVE = FAMILIES.index('move')
     lanes = args.lanes
     engine = RustGames(SIZE, lanes, both_views=True, max_turns=args.max_turns)
     act = jax.jit(jax.vmap(lambda f, m, k, z: herox.act(params, f, m, k, z, size=SIZE)[:3]))
@@ -61,6 +63,12 @@ def collect(args):
     decisions = np.zeros(lanes, np.int64)            # per lane: decisions and last round of the current game
     rounds = np.zeros(lanes, np.int64)
     rows, finished, ticks, shards = [], [], 0, []
+    # per lane: (seat, turn) -> [action counts per family..., summed move advance, moves], over EVERY decision
+    turn_stats = [{} for _ in range(lanes)]
+    turns = []
+    families = len(FAMILIES)
+    cells = np.arange(SIZE * SIZE)
+    row_of, col_of = cells // SIZE, cells % SIZE
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -68,7 +76,9 @@ def collect(args):
         # one compressed shard per --shard-games finished games, so memory stays bounded
         if rows:
             path = out.with_name(f'{out.stem}-{len(shards):03d}.npz')
-            np.savez_compressed(path, **{k: np.stack([r[k] for r in rows]) for k in rows[0]})
+            extra = {f'turn_{k}': np.stack([t[k] for t in turns]) for k in turns[0]} if turns else {}
+            np.savez_compressed(path, **{k: np.stack([r[k] for r in rows]) for k in rows[0]}, **extra)
+            turns.clear()
             shards.append(dict(path=path.name, rows=len(rows)))
             rows.clear()
     counts = np.zeros(3, np.int64)
@@ -86,8 +96,19 @@ def collect(args):
         choice, path, _ = act(prepared.features, prepared.masks, jax.random.split(k_act, lanes), jnp.asarray(plan))
         choice = tuple(np.asarray(c) for c in choice)
         path = tuple(np.asarray(p) for p in path)
-        kept = rng.random(lanes) < args.keep
+        kept = (rng.random(lanes) < args.keep) | new_turn       # the first decision of every turn is always kept
+        owners = np.asarray(states.tiles.owner)
         for i in range(lanes):
+            stats = turn_stats[i].setdefault((int(mover[i]), int(turn[i])), np.zeros(families + 2))
+            stats[choice[0][i]] += 1
+            if choice[0][i] == MOVE:
+                # advance: Chebyshev distance to the centroid of the opponent's territory, before minus after
+                enemy = owners[i] == 3 - int(mover[i])
+                if enemy.any():
+                    cy, cx = row_of[enemy].mean(), col_of[enemy].mean()
+                    dist = lambda t: max(abs(row_of[t] - cy), abs(col_of[t] - cx))
+                    stats[families] += dist(choice[1][i]) - dist(choice[2][i])
+                    stats[families + 1] += 1
             last[i] = (int(turn[i]), int(mover[i]))
             decisions[i] += 1
             rounds[i] = max(rounds[i], int(turn[i]))
@@ -96,9 +117,8 @@ def collect(args):
             buffers[i].append(dict(view=np.asarray(prepared.view[i]), opp_view=np.asarray(prepared.opp_view[i]),
                                    family=choice[0][i], source=choice[1][i], target=choice[2][i],
                                    family_mask=path[0][i], source_mask=path[1][i], target_mask=path[2][i],
-                                   plan=plan[i], seat=int(mover[i]), turn=int(turn[i])))
+                                   plan=plan[i], seat=int(mover[i]), turn=int(turn[i]), first=bool(new_turn[i])))
         scores = np.asarray(states.players.score)          # the last pre-action state (the tick resets done lanes)
-        owners = np.asarray(states.tiles.owner)
         tick, status = engine.tick(states, choice, np.array([next(next_seed) for _ in range(lanes)]))
         if np.any(np.asarray(status) != 0):
             raise RuntimeError('illegal action in self-play')
@@ -116,6 +136,10 @@ def collect(args):
                                  turns_left=final_turn - r['turn'],
                                  ownership=np.where(owners[i] == me, 1, np.where(owners[i] == other, -1, 0)
                                                     ).astype(np.int8)))
+            for (seat, t), stats in sorted(turn_stats[i].items()):
+                turns.append(dict(game=game, seat=seat, turn=t, counts=stats[:families].astype(np.int16),
+                                  advance=np.float32(stats[families]), advance_moves=np.int16(stats[families + 1])))
+            turn_stats[i] = {}
             finished.append(dict(game=game, decisions=int(decisions[i]), kept=len(buffers[i]), rounds=final_turn,
                                  capped=capped, winner=0 if capped else int(np.argmax(rewards)) + 1))
             buffers[i], last[i], decisions[i], rounds[i] = [], None, 0, 0
@@ -177,9 +201,13 @@ def train(args):
     print(f'{len(data["game"])} rows from {len(games)} games: {len(train_rows)} train, {len(val_rows)} validation '
           f'(games {sorted(val_games)})')
 
+    names = herox.VALUE_HEADS if args.stage == 'value' else tuple(params['heads'])
+    train_heads, frozen_heads = herox.head_group(params['heads'], names)
+    print(f'stage {args.stage}: training heads {sorted(train_heads)} and the critic')
+
     def loss(trainable, batch):
         heads, wdl_critic = trainable
-        return herox.head_loss(dict(params, heads=heads), wdl_critic, batch)
+        return herox.head_loss(dict(params, heads={**frozen_heads, **heads}), wdl_critic, batch)
 
     grad = jax.jit(jax.value_and_grad(loss, has_aux=True))
     metrics_of = jax.jit(lambda t, b: loss(t, b)[1])
@@ -189,7 +217,7 @@ def train(args):
         sizes = [min(args.batch, len(val_rows) - i) for i in range(0, len(val_rows), args.batch)]
         return {k: float(sum(float(p[k]) * n for p, n in zip(parts, sizes)) / sum(sizes)) for k in parts[0]}
 
-    trainable = (params['heads'], critic)
+    trainable = (train_heads, critic)
     opt = ppo.adam_init(trainable)
     counts = np.bincount(data['outcome'][train_rows], minlength=3) + 1e-9
     freq = counts / counts.sum()
@@ -210,10 +238,10 @@ def train(args):
     print(f'validation baseline: outcome-frequency cross-entropy {val_freq_ce:.4f} '
           f'(train frequencies win/draw/loss {np.round(freq, 3).tolist()})')
     if args.out:
-        herox.save(args.out, dict(params, heads=trainable[0]), trainable[1],
+        herox.save(args.out, dict(params, heads={**frozen_heads, **trainable[0]}), trainable[1],
                    json.loads(Path(args.init).with_suffix('.json').read_text())['base'] if args.init else
                    dict(size=SIZE, blocks=6, width=128, architecture='transformer-v3-p2-h4', obs_version=3),
-                   smoke_data=str(args.data), steps=args.steps)
+                   smoke_data=str(args.data), steps=args.steps, stage=args.stage)
         print('saved', args.out)
 
 
@@ -241,6 +269,8 @@ def main():
     t.add_argument('--log-every', type=int, default=25)
     t.add_argument('--seed', type=int, default=0)
     t.add_argument('--out', default='')
+    t.add_argument('--stage', choices=('value', 'all'), default='all',
+                   help='value: train only the value heads and the critic (FiLM, plan embedding, gate, macro frozen)')
     t.set_defaults(run=train)
     args = parser.parse_args()
     args.run(args)

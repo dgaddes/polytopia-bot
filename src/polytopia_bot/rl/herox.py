@@ -48,9 +48,10 @@ DRAW_BIAS = -4.                          # from_plato's critic: p(draw) starts s
 
 # ---------------------------------------------------------------- parameters
 
-def init_heads(key, width: int) -> dict:
-    """The new parameters (76,734 at width 128). FiLM and plan_query_gate start at zero, so the policy is unchanged;
-    plan_embedding is small and random (both zero would leave each other without a gradient)."""
+def init_heads(key, width: int, families: int = 17) -> dict:
+    """The new parameters (110,030 at width 128). FiLM, head FiLM, the family bias and plan_query_gate start at zero,
+    so the policy is unchanged; plan_embedding is small and random (both zero would leave each other without a
+    gradient)."""
     keys = iter(jax.random.split(key, 10))
 
     def dense(a, b, scale=1.):
@@ -65,6 +66,8 @@ def init_heads(key, width: int) -> dict:
         plan_embedding=jax.random.normal(next(keys), (PLAN_COUNT, width)) * .1,
         plan_query_gate=jnp.zeros(()),
         film=dict(w=jnp.zeros((width, 2 * width)), b=jnp.zeros(2 * width)),
+        head_film=dict(w=jnp.zeros((width, 2 * width)), b=jnp.zeros(2 * width)),
+        family_bias=jnp.zeros((PLAN_COUNT, families)),
         macro_norm=norm(), macro=dense(width, PLAN_COUNT, .01),
         wdl_norm=norm(), wdl_hidden=dense(width, width), wdl=dense(width, 3, .01),
         score_hidden=dense(width, width), score=dense(width, SCORE_BUCKETS, .01),
@@ -88,7 +91,8 @@ def from_plato(policy: dict, critic: dict, key=None) -> tuple:
         raise ValueError('from_plato needs a transformer-v3 policy')
     width = policy['global_token']['w'].shape[1]
     key = jax.random.key(0) if key is None else key
-    return dict(policy=policy, heads=init_heads(key, width)), critic_from_v3(critic)
+    families = policy['family']['w'].shape[1]
+    return dict(policy=policy, heads=init_heads(key, width, families)), critic_from_v3(critic)
 
 
 def init(key, board_channels: int, global_channels: int, *, size: int, width: int, blocks: int,
@@ -100,6 +104,19 @@ def init(key, board_channels: int, global_channels: int, *, size: int, width: in
     critic = transformer_v3.init_critic(b, board_channels, global_channels, size=size, width=width,
                                         architecture=architecture)
     return from_plato(policy, critic, c)
+
+
+VALUE_HEADS = ('value_token', 'wdl_norm', 'wdl_hidden', 'wdl', 'score_hidden', 'score', 'turns', 'ownership')
+PLAN_HEADS = ('plan_token', 'plan_embedding', 'plan_query_gate', 'film', 'head_film', 'family_bias', 'macro_norm', 'macro')
+# Stage B (frozen trunk): the plan acts on the policy heads only. Input FiLM and plan_token stay as they are, so every
+# token, and so the value heads, compute exactly what they did after stage A. (Input FiLM through six frozen pre-norm
+# blocks moved the policy very little: docs/herox.md.)
+HEAD_SIDE_PLAN_HEADS = ('plan_embedding', 'plan_query_gate', 'head_film', 'family_bias', 'macro_norm', 'macro')
+
+
+def head_group(heads: dict, names) -> tuple:
+    """(the heads in `names`, the rest): train one group with the other frozen, merging them back with {**a, **b}."""
+    return {k: v for k, v in heads.items() if k in names}, {k: v for k, v in heads.items() if k not in names}
 
 
 def parameter_counts(params: dict, critic: dict) -> dict:
@@ -153,14 +170,21 @@ def encode(params: dict, board: jax.Array, global_state: jax.Array, plan) -> dic
     else:
         tiles = transformer_v3._from_patches(linear(out[:patches], policy['v3_unpatch']), size, patch) + tile_embedding
     return dict(tokens=x[:patches + 1], tiles=jax.nn.silu(tiles), g=out[patches], plan=out[patches + 1],
-                value=out[patches + 2], e=e)
+                value=out[patches + 2], e=e, z=plan)
 
 
-def _conditioned(params: dict, e: jax.Array) -> dict:
-    """Policy parameters whose target query carries the plan: network.target_logits adds family_embedding[family]
-    to the query, so shifting every row by gate * e adds it for whichever family is chosen."""
-    policy = params['policy']
-    return dict(policy, family_embedding=policy['family_embedding'] + params['heads']['plan_query_gate'] * e)
+def _conditioned(params: dict, encoded: dict) -> tuple:
+    """(policy parameters, tiles, g) for the action heads under the plan:
+      * head FiLM: tiles and g scaled and shifted by (1 + gamma, beta) of e_z (the value heads read the unmodulated
+        outputs);
+      * family_bias[z] added to the family logits;
+      * gate * e_z added to the target query: network.target_logits adds family_embedding[family] to the query, so
+        shifting every row by it adds it for whichever family is chosen."""
+    policy, heads, e = params['policy'], params['heads'], encoded['e']
+    gamma, beta = jnp.split(network.dense(e, heads['head_film']), 2)
+    family = dict(policy['family'], b=policy['family']['b'] + heads['family_bias'][encoded['z']])
+    conditioned = dict(policy, family=family, family_embedding=policy['family_embedding'] + heads['plan_query_gate'] * e)
+    return conditioned, encoded['tiles'] * (1. + gamma) + beta, encoded['g'] * (1. + gamma) + beta
 
 
 def _norm(x, n):
@@ -212,8 +236,8 @@ def act(params: dict, features, masks, key, plan, *, size: int, deterministic: b
     """Play from the own view: (choice, path masks, logp, outputs). outputs has the macro logits (for choosing the
     next plan), the value heads and the scalar value p(win) - p(loss) for search."""
     encoded = encode(params, features.board, features.global_state, plan)
-    choice, path, logp = network.sample_from(_conditioned(params, encoded['e']), encoded['tiles'], encoded['g'], masks,
-                                             key, size=size, deterministic=deterministic)
+    conditioned, tiles, g = _conditioned(params, encoded)
+    choice, path, logp = network.sample_from(conditioned, tiles, g, masks, key, size=size, deterministic=deterministic)
     heads = value_heads(params, encoded)
     return choice, path, logp, dict(macro=macro_logits(params, encoded), value=wdl_value(heads['wdl']), **heads)
 
@@ -232,14 +256,51 @@ def evaluate(params: dict, critic: dict, features, choice, masks, plan) -> dict:
     log-probability and entropy, macro logits, value heads and critic WDL logits, from ONE public encoder pass."""
     own_board, own_glob, opp_board, opp_glob = transformer_v3._split_views(features)
     encoded = encode(params, own_board, own_glob, plan)
-    conditioned = _conditioned(params, encoded['e'])
-    tiles, g = encoded['tiles'], encoded['g']
+    logp, entropy = _action_logp(params, encoded, choice, masks)
+    return dict(logp=logp, entropy=entropy, macro=macro_logits(params, encoded),
+                critic_wdl=critic_wdl(params, critic, encoded['tokens'], opp_board, opp_glob),
+                **value_heads(params, encoded))
+
+
+def _action_logp(params: dict, encoded: dict, choice, masks) -> tuple:
+    """(log-probability, entropy) of a stored action path under the plan-conditioned policy."""
+    conditioned, tiles, g = _conditioned(params, encoded)
     logits = (network.dense(g, conditioned['family']), network.dense(tiles, conditioned['source'])[:, choice.family],
               network.target_logits(conditioned, tiles, g, choice.family, choice.source))
     pairs = [network.logprob_entropy(l, m, a) for l, m, a in zip(logits, masks, choice, strict=True)]
-    return dict(logp=sum(p[0] for p in pairs), entropy=sum(p[1] for p in pairs), macro=macro_logits(params, encoded),
-                critic_wdl=critic_wdl(params, critic, encoded['tokens'], opp_board, opp_glob),
-                **value_heads(params, encoded))
+    return sum(p[0] for p in pairs), sum(p[1] for p in pairs)
+
+
+def action_logp(params: dict, board, global_state, choice, masks, plan) -> jax.Array:
+    """log pi(action | own view, plan) for one row, from the own view only (no critic)."""
+    return _action_logp(params, encode(params, board, global_state, plan), choice, masks)[0]
+
+
+def family_probs(params: dict, board, global_state, family_mask, plan) -> jax.Array:
+    """The plan-conditioned policy's distribution over action families (legal ones only)."""
+    conditioned, _, g = _conditioned(params, encode(params, board, global_state, plan))
+    logits = network.dense(g, conditioned['family'])
+    return jax.nn.softmax(jnp.where(family_mask, logits, -1e9))
+
+
+def plan_loss(params: dict, rows: dict, starts: dict, *, macro_coef=1.) -> tuple:
+    """Stage B: hindsight plan imitation on self-play.
+
+      rows: board, global_state, choice, masks, plan [rows] = the label of the turn the action belongs to.
+        Loss: -log pi(action | state, label), so each plan learns to play like its cluster of turns.
+      starts: board, global_state, previous [rows] (the seat's previous label, 0 at game start), label [rows], at the
+        first decision of a turn. Loss: macro cross-entropy, read from a pass conditioned on `previous` as choose_plan.
+
+    Differentiate with respect to the PLAN_HEADS group only (value heads and Plato frozen)."""
+    logp = jax.vmap(action_logp, in_axes=(None, 0, 0, 0, 0, 0))(
+        params, rows['board'], rows['global_state'], rows['choice'], rows['masks'], rows['plan'])
+    macro = jax.vmap(lambda b, g, z: macro_logits(params, encode(params, b, g, z)))(
+        starts['board'], starts['global_state'], starts['previous'])
+    macro_ce = _cross_entropy(macro, starts['label']).mean()
+    bc = -logp.mean()
+    total = bc + macro_coef * macro_ce
+    return total, dict(loss=total, bc=bc, macro=macro_ce,
+                       macro_accuracy=jnp.mean(jnp.argmax(macro, -1) == starts['label']))
 
 
 # ---------------------------------------------------------------- targets and losses
@@ -318,6 +379,9 @@ def template(spec: dict) -> tuple:
                                        blocks=spec['blocks'], architecture=spec['architecture']))
 
 
+LATER_HEADS = ('head_film', 'family_bias')     # added after the first heroX checkpoints; zero when absent
+
+
 def load(path) -> tuple:
     path = Path(path)
     info = json.loads(path.with_suffix('.json').read_text())
@@ -326,10 +390,19 @@ def load(path) -> tuple:
     trees = template(info['base'])
     out = []
     for tree, source in zip(trees, (path, path.with_name(path.stem + '-critic.npz'))):
-        leaves, structure = jax.tree.flatten(tree)
         with np.load(source, allow_pickle=False) as archive:
+            stored = len(archive.files)
+            added = {}
+            if 'heads' in tree and stored != len(jax.tree.leaves(tree)):
+                # a checkpoint from before the head-side plan parameters: load without them, then add them at zero
+                added = {k: tree['heads'][k] for k in LATER_HEADS}
+                tree = dict(tree, heads={k: v for k, v in tree['heads'].items() if k not in LATER_HEADS})
+            leaves, structure = jax.tree.flatten(tree)
             values = [archive[f'p{i}'] for i in range(len(leaves))]
         if any(v.shape != l.shape for v, l in zip(values, leaves, strict=True)):
             raise ValueError(f'{source}: tensor shapes do not match the heroX template')
-        out.append(structure.unflatten([jnp.asarray(v) for v in values]))
+        loaded = structure.unflatten([jnp.asarray(v) for v in values])
+        if added:
+            loaded = dict(loaded, heads={**loaded['heads'], **jax.tree.map(lambda a: jnp.zeros(a.shape, a.dtype), added)})
+        out.append(loaded)
     return tuple(out)

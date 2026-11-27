@@ -42,10 +42,10 @@ def _trained(params, key=jax.random.key(42)):
 
 
 def test_parameter_counts_match_the_design():
-    """Width 128, 6 blocks, -p2-h4 at 14x14 (Plato's shape): 76,734 new parameters on Plato's 3,212,922."""
+    """Width 128, 6 blocks, -p2-h4 at 14x14 (Plato's shape): 110,030 new parameters on Plato's 3,212,922."""
     params, critic = herox.template(_spec(width=128, blocks=6))
     counts = herox.parameter_counts(params, critic)
-    assert counts == dict(base_policy=3_212_922, new_heads=76_734, policy=3_289_656, critic=401_063)
+    assert counts == dict(base_policy=3_212_922, new_heads=110_030, policy=3_322_952, critic=401_063)
 
 
 def test_conversion_plays_exactly_as_the_base_network(shapes):
@@ -215,7 +215,7 @@ def test_real_plato_converts_exactly(shapes):
     policy = load_checkpoint(PLATO, _template_params(**spec))
     critic = load_checkpoint(PLATO.with_name('final-critic.npz'), _critic_template(**spec))
     params, wdl_critic = herox.from_plato(policy, critic)
-    assert herox.parameter_counts(params, wdl_critic)['policy'] == 3_289_656
+    assert herox.parameter_counts(params, wdl_critic)['policy'] == 3_322_952
     for i in range(3):
         own = _features(jax.random.key(100 + i), *shapes)
         masks, key = _engine_masks(jax.random.key(200 + i)), jax.random.key(300 + i)
@@ -223,3 +223,71 @@ def test_real_plato_converts_exactly(shapes):
         got = herox.act(params, own, masks, key, i, size=SIZE)
         assert tuple(int(c) for c in got[0]) == tuple(int(c) for c in want[0])
         np.testing.assert_allclose(got[2], want[2], rtol=1e-4, atol=1e-4)
+
+
+def _plan_rows(shapes):
+    batch = _batch(shapes)
+    own_board, own_glob, _, _ = jax.vmap(transformer_v3._split_views)(batch['features'])
+    rows = dict(board=own_board, global_state=own_glob, choice=batch['choice'], masks=batch['masks'], plan=batch['plan'])
+    starts = dict(board=own_board, global_state=own_glob, previous=jnp.array([0, 3, 3, 7]), label=jnp.array([3, 3, 7, 1]))
+    return rows, starts
+
+
+def test_plan_loss_trains_only_the_plan_group(shapes):
+    """Stage B: gradients reach the PLAN_HEADS (FiLM through the policy, the macro head through its cross-entropy) and
+    never the value heads; the value stage's group and the plan group partition the heads."""
+    params, _ = herox.from_plato(*_base(_spec()))
+    assert set(herox.VALUE_HEADS) | set(herox.PLAN_HEADS) == set(params['heads'])
+    assert not set(herox.VALUE_HEADS) & set(herox.PLAN_HEADS)
+    rows, starts = _plan_rows(shapes)
+    (total, metrics), grads = jax.value_and_grad(herox.plan_loss, has_aux=True)(params, rows, starts)
+    assert np.isfinite(float(total)) and all(np.isfinite(float(v)) for v in metrics.values())
+    for name in ('film', 'plan_query_gate', 'macro', 'plan_token', 'family_bias', 'head_film'):
+        assert float(max(jnp.abs(x).max() for x in jax.tree.leaves(grads['heads'][name]))) > 0., name
+    # value_token is the one exception: the PLAN token attends to it (readouts see all 52 tokens); stage B freezes it
+    for name in set(herox.VALUE_HEADS) - {'value_token'}:
+        assert all(float(jnp.abs(x).max()) == 0. for x in jax.tree.leaves(grads['heads'][name])), name
+    # at conversion every plan gives Plato's log-probability, so the imitation term is Plato's NLL
+    plato = jax.vmap(lambda b, g, c, m: herox.action_logp(params, b, g, c, m, 0))(
+        rows['board'], rows['global_state'], rows['choice'], rows['masks'])
+    np.testing.assert_allclose(float(metrics['bc']), -float(plato.mean()), rtol=1e-5)
+
+
+def test_family_probs_sum_to_one_over_legal_families(shapes):
+    params, _ = herox.from_plato(*_base(_spec()))
+    rows, _ = _plan_rows(shapes)
+    p = herox.family_probs(params, rows['board'][0], rows['global_state'][0], rows['masks'].family[0], 2)
+    assert abs(float(p.sum()) - 1.) < 1e-5
+    assert float(jnp.where(rows['masks'].family[0], 0., p).sum()) < 1e-6
+
+
+def test_head_side_plan_moves_the_policy_but_not_the_value(shapes):
+    """The stage-B parameters (head FiLM, family bias) change the action distribution per plan while every token, so
+    the value heads and the macro head's input, stays exactly as before."""
+    params, _ = herox.from_plato(*_base(_spec()))
+    rows, _ = _plan_rows(shapes)
+    heads = params['heads']
+    moved = dict(params, heads=dict(heads, family_bias=jax.random.normal(jax.random.key(3), heads['family_bias'].shape),
+                                    head_film=dict(heads['head_film'], w=jax.random.normal(
+                                        jax.random.key(4), heads['head_film']['w'].shape) * .1)))
+    board, glob, choice, masks = rows['board'][0], rows['global_state'][0], jax.tree.map(lambda a: a[0], rows['choice']), \
+        jax.tree.map(lambda a: a[0], rows['masks'])
+    for z in (0, 5):
+        before, after = herox.encode(params, board, glob, z), herox.encode(moved, board, glob, z)
+        np.testing.assert_array_equal(before['value'], after['value'])
+        np.testing.assert_array_equal(herox.value_heads(params, before)['wdl'], herox.value_heads(moved, after)['wdl'])
+    a, b = (herox.action_logp(moved, board, glob, choice, masks, z) for z in (0, 5))
+    assert abs(float(a) - float(b)) > 1e-3
+    assert abs(float(herox.action_logp(params, board, glob, choice, masks, 0))
+               - float(herox.action_logp(params, board, glob, choice, masks, 5))) < 1e-6
+
+
+def test_checkpoints_without_head_side_parameters_still_load(tmp_path):
+    params, critic = herox.from_plato(*_base(_spec()))
+    old = dict(params, heads={k: v for k, v in params['heads'].items() if k not in herox.LATER_HEADS})
+    herox.save(tmp_path / 'old.npz', old, critic, _spec())
+    loaded, _ = herox.load(tmp_path / 'old.npz')
+    assert set(loaded['heads']) == set(params['heads'])
+    for k in herox.LATER_HEADS:
+        assert all(float(jnp.abs(x).max()) == 0. for x in jax.tree.leaves(loaded['heads'][k]))
+    np.testing.assert_array_equal(loaded['heads']['plan_embedding'], params['heads']['plan_embedding'])
