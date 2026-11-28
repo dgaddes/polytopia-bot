@@ -233,6 +233,35 @@ differences of about ±40 Elo, so smaller scorer improvements need either severa
 offline measure that tracks search strength (ranking recorded candidate turns), which the outcome cross-entropy does
 not.
 
+### Offline ranking test (`experiments/herox_rank.py`)
+
+Rebuilds search's decision once, with ground truth, so a scorer is measured in minutes instead of 1.6 h of games:
+300 start-of-turn roots from Plato self-play (rounds 1–35), 16 candidate turns each (lane 0 Plato's greedy turn, the
+rest sampled at temperature 1, as search), 6 rollouts per candidate (Plato at temperature 1 for both sides, 3 of the
+searcher's turns). Rollout 0's position at the searcher's next decision is what each scorer scores (what search
+sees); rollouts 1–5 give the ground truth: the outcome, or Plato's privileged critic (both views, never trained here)
+at the horizon. 28,800 rollouts, 42 min on CPU, built once (`runs/herox/rank-gt.npz`).
+
+Gain = ground truth of the scorer's pick − ground truth of the greedy turn, per searched turn (critic units):
+
+| Scorer | Gain | Pair accuracy (truths differ > 0.05) |
+|---|---|---|
+| stage A | +0.011 [−0.001, +0.023] | 0.606 |
+| 2 blocks | +0.009 [−0.002, +0.019] | 0.607 |
+| 4 blocks + belief | +0.003 [−0.009, +0.014] | 0.606 |
+| untrained heads (`init.npz`) | −0.026 [−0.043, −0.010] | 0.465 |
+| random candidate | −0.009 | |
+| best in hindsight (upper bound, inflated by ground-truth noise) | +0.080 | 1.0 |
+
+- The test separates trained from untrained scorers (+0.03 [+0.01, +0.05] paired) and orders the trained ones as the
+  games did (4 blocks + belief last; stage A ≈ 2 blocks).
+- Every trained scorer orders clearly different candidates correctly only 61% of the time, and the three are equal
+  on that despite 1,000 → 7,000 games and 0 → 4 trained blocks: outcome training does not improve ranking.
+- Plato is nearly deterministic in the opening: in rounds 1–10 about half of 16 sampled turns equal its greedy turn;
+  from round 11 on all 16 differ.
+- Caveat: the ground truth is Plato's critic 3 turns ahead; a scorer trained toward that critic would be graded on
+  its own target, so such a scorer still needs a games check.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored
