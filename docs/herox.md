@@ -262,6 +262,29 @@ Gain = ground truth of the scorer's pick − ground truth of the greedy turn, pe
 - Caveat: the ground truth is Plato's critic 3 turns ahead; a scorer trained toward that critic would be graded on
   its own target, so such a scorer still needs a games check.
 
+### Belief heads on the frozen stage A scorer
+
+Stage A stays the scorer (best or equal on games and on the ranking test, and its trunk is exactly Plato's, so one
+forward pass can serve both the policy and the score). `herox_smoke.py train --stage belief` trains only the four
+belief heads on it: 5,000 labelled games (`belief5000`), 8,000 steps × 64, lr 1e-3, 20 min CPU; kept by validation
+tech + economy cross-entropy. Plato, the value heads and the critic are bit-identical to stage A (validation WDL 0.2145
+before and after; the ranking test picks the same candidate on all 300 roots).
+`runs/herox/stageA-belief.npz`.
+
+| Held-out (1,000 games) | frozen stage A + belief | 4 blocks + belief | belief.py rule | most common bucket |
+|---|---|---|---|---|
+| opponent tech (per tech) | **97.3%** | 97.3% | 91.8% | 91.5% |
+| stars | **69.2%** | 66.8% | 57.3% | 66.5% |
+| income | 31.9% | 35.3% | 13.0% | 9.3% |
+| cities | 51.0% | 58.2% | — | 15.7% |
+| total city level | 51.7% | 56.4% | — | 13.9% |
+| units | 45.4% | 49.9% | — | 9.3% |
+
+The frozen trunk already carries the tech and stars information; unfreezing 4 blocks bought 4–7 points on the
+counts (cities, levels, units) at the cost of a worse scorer. Next: sample the opponent's tech, stars and units in
+`belief.py` from these heads instead of its rules; expected to be worth little on today's single-tribe 14×14 games
+(the leaky test), but it is the part that should matter with tribes and bigger maps.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored

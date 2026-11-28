@@ -277,9 +277,11 @@ def train(args):
     print(f'{len(data["game"])} rows from {len(games)} games: {len(train_rows)} train, {len(val_rows)} validation '
           f'({len(np.unique(data["game"][is_val]))} held-out games)')
 
-    names = herox.VALUE_HEADS if args.stage == 'value' else tuple(params['heads'])
+    names = dict(value=herox.VALUE_HEADS, belief=herox.BELIEF_HEADS).get(args.stage, tuple(params['heads']))
     train_heads, frozen_heads = herox.head_group(params['heads'], names)
-    print(f'stage {args.stage}: training heads {sorted(train_heads)} and the critic')
+    # stage belief: only the opponent-state heads; the critic, value heads and trunk stay exactly as loaded
+    train_critic = args.stage != 'belief'
+    print(f'stage {args.stage}: training heads {sorted(train_heads)}' + (' and the critic' if train_critic else ''))
     n = args.unfreeze_blocks
     blocks = params['policy']['transformer']
     if n:
@@ -297,7 +299,7 @@ def train(args):
 
     def loss(trainable, batch):
         heads, wdl_critic, tail = trainable
-        return herox.head_loss(merged(heads, tail), wdl_critic, batch)
+        return herox.head_loss(merged(heads, tail), wdl_critic if train_critic else critic, batch)
 
     grad = jax.jit(jax.value_and_grad(loss, has_aux=True))
     metrics_of = jax.jit(lambda t, b: loss(t, b)[1])
@@ -307,14 +309,16 @@ def train(args):
         sizes = [min(args.batch, len(val_rows) - i) for i in range(0, len(val_rows), args.batch)]
         return {k: float(sum(float(p[k]) * n for p, n in zip(parts, sizes)) / sum(sizes)) for k in parts[0]}
 
-    trainable = (train_heads, critic, tail)
+    trainable = (train_heads, critic if train_critic else {}, tail)
     opt = ppo.adam_init(trainable)
     counts = np.bincount(data['outcome'][train_rows], minlength=3) + 1e-9
     freq = counts / counts.sum()
     val_freq_ce = float(-np.log(freq[data['outcome'][val_rows]]).mean())
     before = validate(trainable)
     print('validation before:', json.dumps({k: round(v, 4) for k, v in before.items()}))
-    best = (before['wdl'], 0, trainable)
+    # the kept weights: lowest validation WDL cross-entropy, or for stage belief the belief losses (WDL cannot move)
+    criterion = (lambda m: m['tech'] + m['economy']) if args.stage == 'belief' else (lambda m: m['wdl'])
+    best = (criterion(before), 0, trainable)
     started = time.time()
     for step in range(1, args.steps + 1):
         index = rng.choice(train_rows, args.batch, replace=False)
@@ -327,13 +331,14 @@ def train(args):
         if args.val_every and step % args.val_every == 0 and step < args.steps:
             mid = validate(trainable)
             print(f'validation at step {step}:', json.dumps({k: round(v, 4) for k, v in mid.items()}), flush=True)
-            if mid['wdl'] < best[0]:
-                best = (mid['wdl'], step, trainable)
+            if criterion(mid) < best[0]:
+                best = (criterion(mid), step, trainable)
     after = validate(trainable)
     if args.val_every:
-        if after['wdl'] < best[0]:
-            best = (after['wdl'], args.steps, trainable)
-        print(f'best validation WDL cross-entropy {best[0]:.4f} at step {best[1]} (kept)')
+        if criterion(after) < best[0]:
+            best = (criterion(after), args.steps, trainable)
+        print(f'best validation {"tech + economy" if args.stage == "belief" else "WDL"} cross-entropy {best[0]:.4f} '
+              f'at step {best[1]} (kept)')
         trainable = best[2]
     print('validation after: ', json.dumps({k: round(v, 4) for k, v in after.items()}))
     print(f'validation baseline: outcome-frequency cross-entropy {val_freq_ce:.4f} '
@@ -342,7 +347,7 @@ def train(args):
         print('belief baselines on the validation rows with labels:', json.dumps(_belief_baselines(
             data, val_rows[data['has_belief'][val_rows]], train_rows[data['has_belief'][train_rows]])))
     if args.out:
-        herox.save(args.out, merged(trainable[0], trainable[2]), trainable[1],
+        herox.save(args.out, merged(trainable[0], trainable[2]), trainable[1] if train_critic else critic,
                    json.loads(Path(args.init).with_suffix('.json').read_text())['base'] if args.init else
                    dict(size=SIZE, blocks=6, width=128, architecture='transformer-v3-p2-h4', obs_version=3),
                    smoke_data=str(args.data), steps=args.steps, stage=args.stage, unfreeze_blocks=n,
@@ -376,8 +381,9 @@ def main():
     t.add_argument('--log-every', type=int, default=25)
     t.add_argument('--seed', type=int, default=0)
     t.add_argument('--out', default='')
-    t.add_argument('--stage', choices=('value', 'all'), default='all',
-                   help='value: train only the value heads and the critic (FiLM, plan embedding, gate, macro frozen)')
+    t.add_argument('--stage', choices=('value', 'belief', 'all'), default='all',
+                   help='value: train only the value (and belief) heads and the critic (FiLM, plan embedding, gate, '
+                        'macro frozen); belief: only the opponent-state heads (critic, value heads, trunk frozen)')
     t.add_argument('--unfreeze-blocks', type=int, default=0,
                    help='also train the last N transformer blocks and the final norm (a scoring copy for search)')
     t.add_argument('--val-every', type=int, default=0, help='validate every N steps and keep the best (WDL) weights')
