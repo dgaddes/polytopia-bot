@@ -311,6 +311,21 @@ the other half.
 **Cost** (`TurnSearcher(replies=64, halving=False)`: 16 candidates × 4 replies each, evenly; one process, leak-free,
 Stage A scorer): 2.1 s per searched turn vs 1.4 s for plain d=1.
 
+### Scorer improvements: critic targets, and Plato's critic on sampled worlds
+
+- **Value heads distilled from the privileged critic** (frozen trunk, outcome loss weight 0.1, critic KL 1,
+  6,000 steps): ranking gain +0.008 vs stage A's +0.011 (paired +0.003 [−0.003, +0.011]); the heads barely moved
+  toward the teacher, and that critic was no better at outcomes than the value head (CE 0.231 vs 0.223). Every
+  scorer trained so far ranks clearly different candidates correctly about 61% of the time.
+- Stage A's ranking is worst in balanced positions (pair accuracy 0.578 where |score| < 0.5; 55% of the informative
+  pairs). Half of all roots are already decided (|score| > 0.95), where candidates barely differ in truth either.
+- **Plato's own privileged critic as the scorer, on the sampled worlds of leak-free search** (`--privileged
+  weights/plato/final-critic.npz`; it reads both seats' views of each lane, where the other view is the sampler's
+  guess, so nothing leaks; `search_arena` refuses it without `determinize`). Same 100 maps × both seats:
+  126–71–3, **+98 [+61, +135]** Elo vs raw Plato, 6.4 s per searched turn. Paired: +24 [−19, +69] over stage A
+  (better on 26 games, worse on 19), −8 [−54, +37] vs the 2-block scorer, +31 [−13, +77] vs 4 blocks + belief.
+  Not significant; with the 2-block scorer's +106 falling to +58 on fresh maps, these maps flatter strong arms.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored
