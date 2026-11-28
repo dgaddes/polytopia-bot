@@ -221,6 +221,18 @@ Paired by map: 4 blocks + belief − 2 blocks = **−39 [−79, −2]** (worse o
 - Two changes were made at once (4 blocks + 3.5× data, and the belief losses), so which one hurt is not known; and
   the 2-block scorer's +106 is the best of three arms on the same maps, so part of its lead may be luck.
 
+### Re-test of the 2-block scorer on fresh maps
+
+Same search, 100 new maps (seeds 6,100,000+) × both seats: 114–81–5, **+58 [+26, +94]** Elo vs raw Plato
+(5.0 s per searched turn). Pooled with the original 100 maps: **+81 [+58, +108]** over 200 maps.
+
+So the 2-block scorer's +106 on the first maps was partly luck (it was the best of three arms on those maps), and
+its "+32 over stage A" is not supported. Every scorer so far (stage A +74, 2 blocks +58 to +106, 4 blocks + belief
++67) is consistent with the same gain, about +60 to +80 Elo for leak-free d=1 search on Plato. A 100-map arm resolves
+differences of about ±40 Elo, so smaller scorer improvements need either several hundred maps per arm or a cheaper
+offline measure that tracks search strength (ranking recorded candidate turns), which the outcome cross-entropy does
+not.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored
