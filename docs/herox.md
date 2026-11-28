@@ -325,6 +325,11 @@ Stage A scorer): 2.1 s per searched turn vs 1.4 s for plain d=1.
   126–71–3, **+98 [+61, +135]** Elo vs raw Plato, 6.4 s per searched turn. Paired: +24 [−19, +69] over stage A
   (better on 26 games, worse on 19), −8 [−54, +37] vs the 2-block scorer, +31 [−13, +77] vs 4 blocks + belief.
   Not significant; with the 2-block scorer's +106 falling to +58 on fresh maps, these maps flatter strong arms.
+- **Plato's critic + 4 averaged replies per candidate** (`--replies 64 --no-halving`: 16 candidates × 4 opponent
+  replies, scores averaged), on 100 fresh maps (seed base 6,200,000) × both seats: 137–62 (1 truncation),
+  **+137 [+98, +179]** Elo vs raw Plato, 13.4 s per searched turn, overrides 78%. The best result so far, and on
+  fresh maps. Not paired with any other arm (different maps); against the 2-block scorer's +58 [+26, +94] on its own
+  fresh maps the gap is about +79, roughly ±55, so averaging very likely helps, consistent with the offline test.
 
 ## Not built yet
 
