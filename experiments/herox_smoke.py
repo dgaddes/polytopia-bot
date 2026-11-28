@@ -280,7 +280,7 @@ def train(args):
     names = dict(value=herox.VALUE_HEADS, belief=herox.BELIEF_HEADS).get(args.stage, tuple(params['heads']))
     train_heads, frozen_heads = herox.head_group(params['heads'], names)
     # stage belief: only the opponent-state heads; the critic, value heads and trunk stay exactly as loaded
-    train_critic = args.stage != 'belief'
+    train_critic = args.stage != 'belief' and args.critic_coef > 0
     print(f'stage {args.stage}: training heads {sorted(train_heads)}' + (' and the critic' if train_critic else ''))
     n = args.unfreeze_blocks
     blocks = params['policy']['transformer']
@@ -299,7 +299,8 @@ def train(args):
 
     def loss(trainable, batch):
         heads, wdl_critic, tail = trainable
-        return herox.head_loss(merged(heads, tail), wdl_critic if train_critic else critic, batch)
+        return herox.head_loss(merged(heads, tail), wdl_critic if train_critic else critic, batch,
+                               wdl_coef=args.wdl_coef, distill_coef=args.distill_coef, critic_coef=args.critic_coef)
 
     grad = jax.jit(jax.value_and_grad(loss, has_aux=True))
     metrics_of = jax.jit(lambda t, b: loss(t, b)[1])
@@ -388,6 +389,9 @@ def main():
                    help='also train the last N transformer blocks and the final norm (a scoring copy for search)')
     t.add_argument('--val-every', type=int, default=0, help='validate every N steps and keep the best (WDL) weights')
     t.add_argument('--row-fraction', default='', help='per dataset (comma-separated, as --data): fraction of rows kept')
+    t.add_argument('--wdl-coef', type=float, default=1., help='value head: cross-entropy to the game outcome')
+    t.add_argument('--distill-coef', type=float, default=1., help="value head: KL from the privileged critic's WDL")
+    t.add_argument('--critic-coef', type=float, default=1., help="the critic's own cross-entropy to the outcome")
     t.set_defaults(run=train)
     args = parser.parse_args()
     args.run(args)

@@ -32,6 +32,8 @@ def main():
     parser.add_argument('--arm', choices=('leakfree', 'leaky'), required=True)
     parser.add_argument('--plato', default=str(ROOT / 'weights' / 'plato' / 'final.npz'))
     parser.add_argument('--herox', default='runs/herox/stageA.npz', help='heroX checkpoint whose value token scores')
+    parser.add_argument('--privileged', default='', help="instead: a transformer-v3 critic (e.g. weights/plato/"
+                        "final-critic.npz) scoring both seats' views of each sampled world (leakfree arm only)")
     parser.add_argument('--maps', type=int, default=50, help='maps; each is played from both seats')
     parser.add_argument('--seed-base', type=int, default=6_000_000)
     parser.add_argument('--lanes', type=int, default=16)
@@ -45,7 +47,9 @@ def main():
 
     from polytopia_bot.rl import search_arena
     from polytopia_bot.rl.distributed import _env_setup
-    cfg = dict(candidate=args.plato, opponent=args.plato, herox_value=str(Path(args.herox).resolve()),
+    scorer = (dict(privileged_value=str(Path(args.privileged).resolve())) if args.privileged else
+              dict(herox_value=str(Path(args.herox).resolve())))
+    cfg = dict(candidate=args.plato, opponent=args.plato, **scorer,
                lanes=args.lanes, depth=args.depth, temperature=1., rollout_temperature=1., replies=args.replies,
                determinize=args.arm == 'leakfree', halving=args.halving)
     items = [(args.seed_base + m, seat) for m in range(args.maps) for seat in (1, 2)]

@@ -47,6 +47,15 @@ def _setup(cfg, core):
     opp = load_checkpoint(cfg['opponent'], checkpoint_template(cfg['opponent']))
     # cfg['value']: a second checkpoint whose (fog-only) value head scores the candidate's lanes
     value = load_checkpoint(cfg['value'], checkpoint_template(cfg['value'])) if cfg.get('value') else None
+    if cfg.get('privileged_value'):   # a transformer-v3 critic (both views of each lane): needs determinize
+        if not cfg.get('determinize'):
+            raise ValueError('privileged_value needs determinize=True, or the critic reads the true hidden state')
+        from .distributed import _critic_template, network_spec
+        crit = Path(cfg['privileged_value'])
+        value = dict(policy=load_checkpoint(crit.with_name(crit.name.replace('-critic', '')),
+                                            checkpoint_template(str(crit.with_name(crit.name.replace('-critic', ''))))),
+                     privileged_critic=load_checkpoint(crit, _critic_template(**network_spec(
+                         crit.with_name(crit.name.replace('-critic', ''))))))
     if cfg.get('herox_value'):   # a heroX checkpoint: its value token scores the lanes (search._value)
         from . import herox
         value = herox.load(cfg['herox_value'])[0]

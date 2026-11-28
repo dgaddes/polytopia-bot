@@ -186,9 +186,27 @@ class _Nets:
                                    greedy=greedy, force=force, forced=(ff, fs))
         self.sample = jax.jit(jax.vmap(sample, in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0)))
         self.value = jax.jit(jax.vmap(lambda params, view: _value(params, features(view)), in_axes=(None, 0)))
+
+        def privileged(params, own, opp):
+            from . import transformer_v3
+            from .observation import Features
+            a, b = features(own), features(opp)
+            both = Features(jnp.concatenate((a.board, b.board), -1), jnp.concatenate((a.global_state, b.global_state), -1))
+            return transformer_v3.value(params['policy'], params['privileged_critic'], both)
+        self.privileged = jax.jit(jax.vmap(privileged, in_axes=(None, 0, 0)))
         self.root_first = jax.jit(lambda params, view, masks, key, lanes: root_first_actions(
             params, features(view), masks, key, size=size, lanes=lanes), static_argnums=4)
         self.split = jax.jit(jax.vmap(jax.random.split))
+
+    def score(self, scorer, lanes, seat):
+        """Each lane's value from `seat`'s side ([k] seats). A scorer with a 'privileged_critic' (a transformer-v3
+        critic, e.g. Plato's final-critic.npz, with its policy) reads both seats' views of the lane: leak-free only
+        when the lanes run on a sampled world (TurnSearcher(determinize=True)), where the other view is a guess."""
+        if isinstance(scorer, dict) and 'privileged_critic' in scorer:
+            one, two = lanes.views(1), lanes.views(2)
+            first_seat = (np.asarray(seat) == 1)[:, None]
+            return np.asarray(self.privileged(scorer, np.where(first_seat, one, two), np.where(first_seat, two, one)))
+        return np.asarray(self.value(scorer, lanes.views(None if seat is None else seat)))
 
 
 class Planner:
@@ -247,12 +265,15 @@ class Planner:
             horizon = (depth > 0) & (changes == 2 * depth)
             post_end = (depth == 0) & after_end & (changes == 1)
             root_end = (depth == 0) & (not after_end) & in_root & (fam == END_FAMILY)
-            if scorer is not None:   # a separate value network scores the lanes
-                value = np.asarray(self.nets.value(scorer, view))
+            if scorer is not None:   # a separate value network scores the lanes, from the mover's side
+                value = (self.nets.score(scorer, lanes, mover) if isinstance(scorer, dict) and 'privileged_critic' in scorer
+                         else np.asarray(self.nets.value(scorer, view)))
             own_value = np.where(mover == me, value, -value)
             if after_end:
                 if (post_end & ~done).any():   # not the mover's turn: the searcher's own observation
-                    mine = np.asarray(self.nets.value(scorer if scorer is not None else policy, lanes.views(me)))
+                    mine = (self.nets.score(scorer, lanes, np.full(k, me)) if isinstance(scorer, dict)
+                            and 'privileged_critic' in scorer else
+                            np.asarray(self.nets.value(scorer if scorer is not None else policy, lanes.views(me))))
                     value = np.where(post_end, mine, value)
                 horizon = horizon | post_end
             active = ~done
