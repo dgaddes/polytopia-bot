@@ -285,6 +285,32 @@ counts (cities, levels, units) at the cost of a worse scorer. Next: sample the o
 `belief.py` from these heads instead of its rules; expected to be worth little on today's single-tribe 14×14 games
 (the leaky test), but it is the part that should matter with tribes and bigger maps.
 
+### Averaged rollouts and a pull toward Plato (offline, `herox_rank.py pick`)
+
+Ideas from Ataraxos (Stratego): average the value over several rollouts per candidate, and regularize the pick
+toward the policy. Tested on `rank-gt.npz` with no new games: picks use rollouts 0–3, grading uses rollouts 4–5
+only (critic units, vs the greedy turn on the same rollouts); τ and margins chosen on half the roots and reported on
+the other half.
+
+| Pick | Gain | vs current search (paired) |
+|---|---|---|
+| current: Stage A scorer, 1 rollout, argmax | +0.0155 [+0.0012, +0.0303] | — |
+| Stage A scorer, mean of 4 rollouts, argmax | +0.0225 [+0.0069, +0.0389] | +0.0070 [−0.0040, +0.0186] |
+| critic 3 turns ahead, mean of 3 rollouts (upper bound) | +0.0326 [+0.0179, +0.0485] | +0.0171 [+0.0038, +0.0318] |
+| softmax(score / τ) over the 16 candidates, τ tuned | +0.0141 (1 rollout), +0.0210 (4) | −0.0014, +0.0055 |
+| override greedy only past a margin, tuned | +0.0131 (1), +0.0159 (4) | −0.0024, +0.0004 |
+| Plato's own sampled turn (τ → ∞) | −0.0073 | |
+
+- **Averaging rollouts helps in the right direction** (+45% gain with 4 rollouts, not significant); with a better
+  evaluator (the privileged critic) averaging 3 rollouts doubles the gain, significantly. Score noise is a large
+  part of what limits search.
+- **Pulling toward Plato does not help here.** The best τ is the smallest tried (the argmax); every larger τ is
+  worse, and τ → ∞ (Plato's sampled turn) is worse than greedy. The paper's failure mode, search exploiting the
+  network's quirks, comes from searching far beyond the policy; our candidates are already Plato's own samples.
+
+**Cost** (`TurnSearcher(replies=64, halving=False)`: 16 candidates × 4 replies each, evenly; one process, leak-free,
+Stage A scorer): 2.1 s per searched turn vs 1.4 s for plain d=1.
+
 ## Not built yet
 
 - **PPO integration** (`rl/ppo.py`, `rl/gpu_resident.py`): the macro head's per-turn advantage, the plan stored

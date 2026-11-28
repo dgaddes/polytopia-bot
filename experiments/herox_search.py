@@ -37,6 +37,8 @@ def main():
     parser.add_argument('--lanes', type=int, default=16)
     parser.add_argument('--depth', type=int, default=1)
     parser.add_argument('--replies', type=int, default=0, help='>0: robust d=1 with this reply budget')
+    parser.add_argument('--no-halving', dest='halving', action='store_false',
+                        help='with --replies: spread the replies evenly over the candidates (replies / lanes each)')
     parser.add_argument('--processes', type=int, default=12)
     parser.add_argument('--out', required=True)
     args = parser.parse_args()
@@ -45,7 +47,7 @@ def main():
     from polytopia_bot.rl.distributed import _env_setup
     cfg = dict(candidate=args.plato, opponent=args.plato, herox_value=str(Path(args.herox).resolve()),
                lanes=args.lanes, depth=args.depth, temperature=1., rollout_temperature=1., replies=args.replies,
-               determinize=args.arm == 'leakfree')
+               determinize=args.arm == 'leakfree', halving=args.halving)
     items = [(args.seed_base + m, seat) for m in range(args.maps) for seat in (1, 2)]
     _env_setup()
     ctx = mp.get_context('spawn')

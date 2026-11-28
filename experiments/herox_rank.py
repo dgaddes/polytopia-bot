@@ -295,6 +295,84 @@ def score(args):
         Path(args.out).write_text(json.dumps(dict(data=args.data, roots=R, candidates=K, rollouts=M, rows=rows), indent=1))
 
 
+def pick(args):
+    """Parts 1-2 of the search changes, offline: average scores over several rollouts per candidate, and pick by
+    softmax(score / tau) over the 16 Plato-sampled candidates instead of the argmax.
+
+    Every pick is graded on rollouts it never used (--grade, default 4,5), against the greedy turn on the same
+    rollouts. Sources: the heroX scorer at the searcher's next decision (what search can use at play time), averaged
+    over the --scorer-sets rollouts; and the privileged ground-truth values (Plato's critic 3 turns ahead, an upper
+    bound) over --truth-sets. A softmax pick's gain is its expected gain sum_k w_k truth_k - truth_0. tau is chosen
+    on one half of the roots and reported on the other half (2-fold), so the reported gain is not tuned on itself."""
+    import jax
+    from polytopia_bot.rl import herox, search
+    from polytopia_bot.rl.cpu_engine import view_features, view_layout
+    d = np.load(args.data)
+    result, reached, ended = d['result'], d['reached'], d['candidate_ended']
+    R, K, M = result.shape
+    grade = [int(g) for g in args.grade.split(',')]
+    truth = result[:, :, grade].mean(-1)                                       # [R, K]
+    base = truth[:, 0]
+    params, _ = herox.load(args.scorer)
+    layout = view_layout(SIZE)
+    f = jax.jit(jax.vmap(lambda v: search._value(params, view_features(v, layout, SIZE))))
+    used = sorted({int(r) for s in args.scorer_sets.split(';') for r in s.split(',')})
+    scored = {}
+    for r in used:
+        live = (reached[:, :, r] & ~ended).reshape(-1)
+        scored[r] = _scores(d['views'][:, :, r].reshape(R * K, -1), live, result[:, :, r].reshape(-1), f).reshape(R, K)
+        print(f'scored rollout {r}', flush=True)
+    sources = {}
+    for s in args.scorer_sets.split(';'):
+        rs = [int(r) for r in s.split(',')]
+        sources[f'scorer, rollouts {s} ({len(rs)})'] = np.mean([scored[r] for r in rs], 0)
+    for s in args.truth_sets.split(';'):
+        rs = [int(r) for r in s.split(',')]
+        sources[f'critic 3 turns ahead, rollouts {s} (upper bound)'] = result[:, :, rs].mean(-1)
+    taus = [float(t) for t in args.taus.split(',')]
+    rng = np.random.default_rng(0)
+    half = rng.permutation(R) < R // 2
+    idx = rng.integers(0, R, (4000, R))
+
+    def argmax_gain(score):
+        best = score.argmax(1)
+        p = np.where(score[np.arange(R), best] > score[:, 0], best, 0)        # ties keep greedy, as search
+        return truth[np.arange(R), p] - base
+
+    def soft_gain(score, tau):
+        w = np.exp((score - score.max(1, keepdims=True)) / tau)
+        w /= w.sum(1, keepdims=True)
+        return (w * truth).sum(1) - base
+
+    ci = lambda g: (float(g.mean()), float(np.percentile(g[idx].mean(1), 2.5)), float(np.percentile(g[idx].mean(1), 97.5)))
+    out, reference = {}, None
+    plato = truth.mean(1) - base                                               # tau -> infinity: Plato's own sample
+    print(f'grading on rollouts {grade}; {R} roots x {K} candidates')
+    print(f'{"Plato sampled turn (tau = inf)":58s} gain %+.4f [%+.4f, %+.4f]' % ci(plato))
+    for name, score in sources.items():
+        g_arg = argmax_gain(score)
+        per_tau = {t: soft_gain(score, t) for t in taus}
+        # 2-fold: tau picked on one half, applied to the other
+        tuned = np.zeros(R)
+        chosen = []
+        for fold in (half, ~half):
+            t_best = max(taus, key=lambda t: per_tau[t][~fold].mean())
+            tuned[fold] = per_tau[t_best][fold]
+            chosen.append(t_best)
+        reference = g_arg if reference is None else reference
+        row = dict(argmax=ci(g_arg), softmax_tuned=ci(tuned), tau_chosen=chosen,
+                   by_tau={t: round(float(per_tau[t].mean()), 4) for t in taus},
+                   tuned_minus_current=ci(tuned - reference), argmax_minus_current=ci(g_arg - reference))
+        out[name] = row
+        print(f'{name:58s} argmax %+.4f [%+.4f, %+.4f]' % row['argmax'] +
+              '   softmax (tau tuned %s) %+.4f [%+.4f, %+.4f]' % ((chosen,) + row['softmax_tuned']))
+        print(f'{"":58s} vs current search: argmax %+.4f [%+.4f, %+.4f]' % row['argmax_minus_current'] +
+              '   softmax %+.4f [%+.4f, %+.4f]' % row['tuned_minus_current'])
+        print(f'{"":58s} by tau: ' + ', '.join(f'{t:g}: {v:+.4f}' for t, v in row['by_tau'].items()), flush=True)
+    if args.out:
+        Path(args.out).write_text(json.dumps(dict(data=args.data, scorer=args.scorer, grade=grade, rows=out), indent=1))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -315,6 +393,15 @@ def main():
     s.add_argument('--out', default='')
     s.add_argument('scorers', nargs='+')
     s.set_defaults(run=score)
+    k = sub.add_parser('pick', help='parts 1-2: averaged rollouts and softmax picks, graded on held-out rollouts')
+    k.add_argument('--data', default='runs/herox/rank-gt.npz')
+    k.add_argument('--scorer', default='runs/herox/stageA.npz')
+    k.add_argument('--scorer-sets', default='0;0,1;0,1,2,3', help='rollout sets averaged by the scorer, ; between sets')
+    k.add_argument('--truth-sets', default='1;1,2,3', help='rollout sets of privileged values (upper bounds)')
+    k.add_argument('--grade', default='4,5')
+    k.add_argument('--taus', default='0.002,0.005,0.01,0.02,0.03,0.05,0.1,0.2,0.5')
+    k.add_argument('--out', default='')
+    k.set_defaults(run=pick)
     args = parser.parse_args()
     args.run(args)
 

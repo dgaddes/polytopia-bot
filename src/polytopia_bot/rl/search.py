@@ -203,11 +203,12 @@ class Planner:
 
     replies=n > 0 (robust d=1): the K candidate turns are played to END once, then scored by averaging
     the critic over sampled opponent replies (at rollout_temperature), with a budget of n replies spent
-    by sequential halving (K, K/2, ..., 2 survivors; the greedy turn always survives). The final pick
-    needs a mean beating the greedy turn's by `margin`."""
+    by sequential halving (K, K/2, ..., 2 survivors; the greedy turn always survives), or with halving=False
+    spread evenly (n / K replies each, one round). The final pick needs a mean beating the greedy turn's by
+    `margin`."""
 
     def __init__(self, *, size, lanes, depth=0, temperature=1., rollout_temperature=0., max_turn_actions=96,
-                 max_steps=None, root='sequence', margin=0., prior_coef=0., after_end=False, replies=0):
+                 max_steps=None, root='sequence', margin=0., prior_coef=0., after_end=False, replies=0, halving=True):
         _check_options(lanes=lanes, depth=depth, rollout_temperature=rollout_temperature, root=root, replies=replies)
         self.size, self.lanes, self.depth, self.root = size, lanes, depth, root
         self.temperature, self.rollout_temperature = temperature, rollout_temperature
@@ -217,7 +218,8 @@ class Planner:
         self.nets = _Nets(size)
         self.main = Lanes(size, lanes)
         if replies:
-            self.width, self.schedule = halving_schedule(lanes, replies)
+            # halving=False: every candidate gets replies // lanes replies, all in one round (a plain average)
+            self.width, self.schedule = halving_schedule(lanes, replies) if halving else (max(replies, lanes), (lanes,))
             self.reply_lanes = Lanes(size, self.width)
 
     def run(self, lanes, start, keys, me, params, greedy_root, ff, fs, *, depth, after_end, changes=0, done=None):
@@ -351,14 +353,15 @@ class TurnSearcher:
 
     def __init__(self, params, *, size=14, lanes=1, depth=0, temperature=1., rollout_temperature=0.,
                  max_turn_actions=96, fast=True, root='sequence', margin=0., prior_coef=0., after_end=False,
-                 replies=0, determinize=False, parallel=False, workers=None, vmap=False, value_params=None):
+                 replies=0, determinize=False, parallel=False, workers=None, vmap=False, value_params=None,
+                 halving=True):
         if value_params is not None and lanes > 1:
             params = (params, value_params)
         self.params, self.size, self.lanes, self.depth, self.max_turn_actions = params, size, lanes, depth, max_turn_actions
         self._plan = Planner(size=size, lanes=lanes, depth=depth if lanes > 1 else 0, temperature=temperature,
                              rollout_temperature=rollout_temperature, max_turn_actions=max_turn_actions, root=root,
                              margin=margin, prior_coef=prior_coef, after_end=after_end,
-                             replies=replies if lanes > 1 else 0)
+                             replies=replies if lanes > 1 else 0, halving=halving)
         self._true = Lanes(size, 1)
         # determinize=True: plan on a world sampled from the searcher's own view (belief.py), replay until it diverges.
         self.determinize, self.fallbacks = determinize, 0

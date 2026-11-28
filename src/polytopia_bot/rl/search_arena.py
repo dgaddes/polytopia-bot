@@ -73,7 +73,7 @@ def _setup(cfg, core):
                             margin=cfg.get('margin', 0.), prior_coef=cfg.get('prior_coef', 0.),
                             after_end=cfg.get('after_end', False), replies=cfg.get('replies', 0),
                             determinize=cfg.get('determinize', False), parallel=cfg.get('parallel', False),
-                            workers=cfg.get('workers'), value_params=value)
+                            workers=cfg.get('workers'), value_params=value, halving=cfg.get('halving', True))
     searcher.compile(state, jax.random.key(0))
     # cfg['opponent_search']: TurnSearcher settings for a searching opponent (search vs search); its lanes are scored
     # by cfg['opponent_value']'s value head if given, else its own. Default: the raw greedy opponent.
